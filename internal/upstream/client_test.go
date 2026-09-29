@@ -444,6 +444,88 @@ func TestUserResourceNegativeClamped(t *testing.T) {
 	}
 }
 
+func TestUserResourceSummaryExpiry(t *testing.T) {
+	// 用相对当前时间构造到期日，避免测试随时间腐化（窗口判定依赖 now）。
+	day := time.Now().In(softRateResetLoc).Add(48 * time.Hour)
+	d1 := time.Date(day.Year(), day.Month(), day.Day(), 10, 0, 0, 0, softRateResetLoc)
+	d2 := time.Date(day.Year(), day.Month(), day.Day(), 18, 0, 0, 0, softRateResetLoc)   // 与 d1 同自然日
+	far := time.Now().In(softRateResetLoc).Add(200 * time.Hour)                          // 窗口外
+	past := time.Now().In(softRateResetLoc).Add(-24 * time.Hour)                         // 已扣空 → 不该主导「最早到期」
+	body := fmt.Sprintf(`{"code":0,"data":{"Response":{"Data":{"Accounts":[
+		{"PackageName":"当日 A","CycleCapacitySize":100,"CycleCapacityRemain":100,"CycleCapacityUsed":0,"CycleEndTime":%q},
+		{"PackageName":"当日 B","CycleCapacitySize":100,"CycleCapacityRemain":60,"CycleCapacityUsed":40,"CycleEndTime":%q},
+		{"PackageName":"已扣空","CycleCapacitySize":100,"CycleCapacityRemain":0,"CycleCapacityUsed":100,"CycleEndTime":%q},
+		{"PackageName":"窗口外","CycleCapacitySize":100,"CycleCapacityRemain":90,"CycleCapacityUsed":10,"CycleEndTime":%q},
+		{"PackageName":"无到期","CapacitySize":50,"CapacityRemain":50,"CapacityUsed":0}
+	]}}}}`,
+		d1.Format(packageEndLayout), d2.Format(packageEndLayout),
+		past.Format(packageEndLayout), far.Format(packageEndLayout))
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {
+			return nil, errors.New("wrong path: " + r.URL.Path)
+		}
+		return jsonResp(200, body), nil
+	})
+
+	s, err := c.UserResourceSummary(&auth.Auth{AccessToken: "at"}, 168*time.Hour)
+	if err != nil {
+		t.Fatalf("summary: %v", err)
+	}
+	if s.Remain != 300 || s.Total != 450 {
+		t.Errorf("remain/total=%d/%d want 300/450", s.Remain, s.Total)
+	}
+	// 最早到期 = 同自然日的更早那一笔；该日到期合计含同日两笔（100+60=160）。
+	if !s.ExpireAt.Equal(d1) {
+		t.Errorf("ExpireAt=%v want %v", s.ExpireAt, d1)
+	}
+	if s.ExpireAmount != 160 {
+		t.Errorf("ExpireAmount=%d want 160 (同日两笔合计)", s.ExpireAmount)
+	}
+	// 快过期窗口（168h）内只有 48h 后那一日 → 160；200h 那笔在窗口外。
+	if s.Expiring != 160 {
+		t.Errorf("Expiring=%d want 160", s.Expiring)
+	}
+
+	// soon<=0：只禁用分桶，不影响最近到期展示（面板用 0 也应有到期信息）。
+	s0, err := c.UserResourceSummary(&auth.Auth{AccessToken: "at"}, 0)
+	if err != nil {
+		t.Fatalf("summary soon=0: %v", err)
+	}
+	if s0.Expiring != 0 {
+		t.Errorf("soon<=0 时 Expiring 应恒 0，得 %d", s0.Expiring)
+	}
+	if !s0.ExpireAt.Equal(d1) || s0.ExpireAmount != 160 {
+		t.Errorf("soon<=0 不应影响到期展示: at=%v amt=%d", s0.ExpireAt, s0.ExpireAmount)
+	}
+}
+
+// TestCreditPackagesEndTimeFallsBackToCycleEndTime 逐包到期字段回退：
+// 上游 ExpiredTime/PackageEndTime 恒空，真值在 CycleEndTime——不回退它，
+// 「积分构成」的到期列永远是「无到期」。
+func TestCreditPackagesEndTimeFallsBackToCycleEndTime(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[
+			{"PackageName":"带回退","CycleCapacitySize":100,"CycleCapacityRemain":100,"CycleEndTime":"2026-10-25 21:11:33"},
+			{"PackageName":"显式优先","CycleCapacitySize":100,"CycleCapacityRemain":100,"ExpiredTime":"2026-11-01 00:00:00","CycleEndTime":"2026-10-25 21:11:33"}
+		]}}}}`), nil
+	})
+	packs, _, _, err := c.CreditPackages(&auth.Auth{AccessToken: "at"})
+	if err != nil {
+		t.Fatalf("packages: %v", err)
+	}
+	if len(packs) != 2 {
+		t.Fatalf("packs=%d want 2", len(packs))
+	}
+	for _, p := range packs {
+		if p.Name == "带回退" && p.EndTime != "2026-10-25 21:11:33" {
+			t.Errorf("回退失败: EndTime=%q", p.EndTime)
+		}
+		if p.Name == "显式优先" && p.EndTime != "2026-11-01 00:00:00" {
+			t.Errorf("显式字段应优先: EndTime=%q", p.EndTime)
+		}
+	}
+}
+
 func TestDailyCheckinAlready(t *testing.T) {
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/daily-checkin") {

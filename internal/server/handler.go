@@ -47,6 +47,11 @@ type Config struct {
 	// nil 时回退静态字段（测试与裸用场景）。
 	Live *livecfg.Holder
 
+	// APIUsers 按用户绑号（config api_users，Live 优先）：key → 绑定账号。
+	// 命中 key 的 /v1 请求只走绑定的号、绝不轮换（谁的 key 记谁的账）。
+	// nil/空 = 无绑定 key，行为与从前完全一致。
+	APIUsers map[string]livecfg.PinnedAccount
+
 	// PromptMode "custom"（网关用自有提示词替换 system）/ "passthrough"（透传）。
 	PromptMode string
 	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
@@ -70,8 +75,9 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		return h.cfg.Live.Load()
 	}
 	return livecfg.Snapshot{
-		APIKey:       h.cfg.APIKey,
-		SoftCooldown: h.cfg.SoftCooldown,
+		APIKey:         h.cfg.APIKey,
+		SoftCooldown:   h.cfg.SoftCooldown,
+		PinnedAccounts: h.cfg.APIUsers,
 	}
 }
 
@@ -138,12 +144,37 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+		live := h.loadLive()
+		// admin key 或任一绑定 key（api_users）均可过鉴权；具体是哪类由各 handler
+		// 经 pinnedOf 二次区分（/status 与面板只认 admin，chat 支持绑号路由）。
+		if !httpauth.VerifyBearer(r, live.APIKey) && !h.knownUserKey(r, live) {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
 		next(w, r)
 	}
+}
+
+// knownUserKey 报告请求的 Bearer 是否为 api_users 绑定表中的 key。
+func (h *Handler) knownUserKey(r *http.Request, live livecfg.Snapshot) bool {
+	key := httpauth.BearerToken(r)
+	if key == "" || key == live.APIKey || len(live.PinnedAccounts) == 0 {
+		return false
+	}
+	_, ok := live.PinnedAccounts[key]
+	return ok
+}
+
+// pinnedOf 返回该请求绑定到的账号（api_users）。admin key 恒返回 false——
+// 管理密钥走全池轮换，不该有"绑号"语义。
+func (h *Handler) pinnedOf(r *http.Request) (livecfg.PinnedAccount, bool) {
+	live := h.loadLive()
+	key := httpauth.BearerToken(r)
+	if key == "" || key == live.APIKey || len(live.PinnedAccounts) == 0 {
+		return livecfg.PinnedAccount{}, false
+	}
+	u, ok := live.PinnedAccounts[key]
+	return u, ok
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
@@ -171,6 +202,11 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
+	if _, pinned := h.pinnedOf(r); pinned {
+		// 绑定 key 只能打聊天：/status 透出全池各号余额/冷却，不给绑定方看。
+		writeOpenAIError(w, http.StatusForbidden, "forbidden", "account-bound keys cannot read pool-wide status")
+		return
+	}
 	total, healthy, cooling, disabled, inFlightFull := h.cfg.Pool.CountsDetailed()
 	sticky := 0
 	if h.cfg.StickyCount != nil {
@@ -550,7 +586,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			unbindSticky()
 		}
 	}
-	recordAttempt := func(uid string, delta pool.TokenUsageDelta, started time.Time) {
+	// ttfb：流式请求的首 token 延迟（stats.TTFB()）；同步/失败尝试传 0。
+	// TPS 分母用生成窗口（latency − ttfb）：TTFB 是上游 prefill/思考等待，
+	// 不是出字速度，摊进分母会把短回复的速率虚低一个数量级（误导「比官方慢」）。
+	// LatencyMs 仍是完整墙钟（延迟列语义不变）。
+	recordAttempt := func(uid string, delta pool.TokenUsageDelta, started time.Time, ttfb time.Duration) {
 		delta.Model = peek.Model
 		latency := time.Since(started)
 		latencyMs := latency.Milliseconds()
@@ -559,9 +599,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		delta.HasLatencyMs = true
 		delta.LatencyMs = latencyMs
-		if delta.HasCompletionTokens && delta.CompletionTokens >= 0 && latencyMs > 0 {
-			delta.HasTokensPerSecond = true
-			delta.TokensPerSecond = float64(delta.CompletionTokens) * 1000 / float64(latencyMs)
+		if delta.HasCompletionTokens && delta.CompletionTokens >= 0 {
+			genMs := float64(latency-ttfb) / float64(time.Millisecond)
+			if ttfb <= 0 {
+				genMs = float64(latencyMs)
+			}
+			// 可信度护栏（与 logChatRow 的 rateMin* 同语义）：生成窗口过小（上游
+			// 整包倒出，TTFB≈total）或样本过少时不出速率——小分母会把 39tok/26ms
+			// 算成 1500tok/s 的假象。不写 HasTokensPerSecond → 面板显示 "—"。
+			if genMs >= float64(rateMinGenWindow/time.Millisecond) && delta.CompletionTokens >= rateMinTokens {
+				delta.HasTokensPerSecond = true
+				delta.TokensPerSecond = float64(delta.CompletionTokens) * 1000 / genMs
+			}
 		}
 		h.cfg.Pool.RecordTokenUsage(uid, delta)
 
@@ -584,6 +633,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				HasLatency:       delta.HasLatencyMs,
 				TokensPerSecond:  delta.TokensPerSecond,
 				HasTPS:           delta.HasTokensPerSecond,
+				CacheHitTokens:   delta.CacheHitTokens,
+				CacheMissTokens:  delta.CacheMissTokens,
+				HasCache:         delta.HasCacheTokens,
+				Credit:           delta.Credit,
+				HasCredit:        delta.HasCredit,
 			}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
 		}
 	}
@@ -641,9 +695,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
+		// 选号：绑定号（api_users）> 会话粘性 > 普通轮换。
+		// 绑定 key 的契约是「只走这个号，绝不换」：绑定号不可用（冷却/禁用/占满/
+		// 该模型被 6004 限额/与请求域不符/根本不存在）时直接报错返回，不回落普通
+		// 轮换——一回落，用量就记到别的号的账上，「谁的 key 记谁的账」即告破灭。
 		var acct *auth.Auth
-		if stickyUID != "" {
+		if pinned, ok := h.pinnedOf(r); ok {
+			acct = h.cfg.Pool.PickByUIDForModel(pinned.UID, bareModel)
+			if acct != nil && realm != "" && acct.Realm() != realm {
+				acct = nil // 绑定号与请求域不符（如 cn 号请求 global: 模型）：同「不可用」
+			}
+			if acct == nil {
+				name := pinned.Name
+				if name == "" {
+					name = logfmt.UID8(pinned.UID)
+				}
+				writeOpenAIError(w, http.StatusServiceUnavailable, "bound_account_unavailable",
+					"bound account "+name+" is cooling down, disabled, or at capacity; bound keys never rotate to other accounts")
+				st.status = http.StatusServiceUnavailable
+				return
+			}
+		} else if stickyUID != "" {
 			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
 			if acct == nil || (realm != "" && acct.Realm() != realm) {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
@@ -718,7 +790,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
 			// 连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
 			// 上游 client 已打 transport error 日志。
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
 			h.cfg.Pool.NoteFailures(acct.UID)
@@ -729,7 +801,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if status >= 400 {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0)
 			st.status = status
 			var kind upstream.ErrKind
 			if uerr != nil {
@@ -843,7 +915,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadGateway
 				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			}
-			recordAttempt(acct.UID, stats.Usage(), attemptStarted)
+			recordAttempt(acct.UID, stats.Usage(), attemptStarted, stats.TTFB())
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
 			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
@@ -864,13 +936,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		resp, err := upstream.Aggregate(rc)
 		rc.Close()
 		if err != nil {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0)
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
 			return
 		}
-		recordAttempt(acct.UID, usageDeltaFromResponse(resp), attemptStarted)
+		recordAttempt(acct.UID, usageDeltaFromResponse(resp), attemptStarted, 0)
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
@@ -996,6 +1068,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 	case upstream.ErrHardCredit:
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），
 		// 不需要异步核查（冗余）。立即换号。
+		h.cfg.Pool.NoteRiskSignal(uid, "14018") // 风控台账：积分耗尽（402/14018）
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
 		// 统一对齐上游重置时间：只要 body 带「将在 … 重置」，无论业务 code 是
@@ -1004,9 +1077,11 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免。
 		if resetAt, ok := upstream.ParseRateReset(body); ok {
 			if upstream.IsModelRateLimit(body) {
+				h.cfg.Pool.NoteRiskSignal(uid, "6004") // 风控台账：模型级限流
 				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "6004 model rate limit")
 				return
 			}
+			h.cfg.Pool.NoteRiskSignal(uid, "429") // 风控台账：账号级限流
 			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), resetAt, "429 rate limit")
 			return
 		}
@@ -1019,18 +1094,21 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
 		// soft_rate_max；已在冷却中的兜底探测不翻倍）。基数取 h.softCooldown()
 		// （热改优先），管理面板改 soft_rate 后立即生效。
+		h.cfg.Pool.NoteRiskSignal(uid, "429") // 风控台账：账号级限流（无重置墙钟形态）
 		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "429 rate limit")
 	case upstream.ErrWafBlock:
 		// WAF 403（无业务信封拦截形态）。软冷却复用 CooldownSoftRate 家族：基数
 		// wafCooldownBase（60s，抖动后落 [45s,75s]）、softStreak 指数升级、封顶
 		// soft_rate_max、冷却中兜底探测不翻倍——全部继承既有语义。
 		// Retry-After 头优先（WAF 拦截页可能带该头）。不 Disable。
+		h.cfg.Pool.NoteRiskSignal(uid, "waf403") // 风控台账：IP/指纹维 WAF 拦截（连坐预警信号）
 		if uerr != nil && uerr.RetryAfter > 0 {
 			h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Now().Add(uerr.RetryAfter), "waf 403 block (retry-after)")
 			return
 		}
 		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
 	case upstream.ErrSessionDead:
+		h.cfg.Pool.NoteRiskSignal(uid, "12153") // 风控台账：会话被杀（最接近封号的信号）
 		h.cfg.Pool.Disable(uid, "12153 session dead")
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
@@ -1043,6 +1121,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
 		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
 		if strings.Contains(strings.ToLower(body), "request illegal") {
+			h.cfg.Pool.NoteRiskSignal(uid, "11140") // 风控台账：上游明示的授权封禁
 			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
 			return
 		}
@@ -1067,6 +1146,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// ——不同账号可能有不同的模型权限，值得换号再试一次。
 	case upstream.ErrModelBlocked:
 		// 11102「该后端无此模型」：(账号, 模型) 负缓存避让。复用 modelCooldowns 机制
+		h.cfg.Pool.NoteRiskSignal(uid, "11102") // 风控台账：模型级负缓存避让
 		// （与 6004 同域），选号侧 healthyForModel 对该账号自动避开该模型。
 		// 立即换号（本轮 continue），该账号该模型冷却，下次选号避开。
 		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)

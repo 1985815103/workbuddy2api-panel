@@ -61,6 +61,12 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// ExpiringSoonWindow 快过期积分窗口（与 scheduler.Config 同源同口径）。
+	// 面板单号「签到 / 余额」两个入口要按同一窗口重算 Expiring——窗口不一致会让
+	// 面板刷新把 pool 里的快过期子集写歪（选号第四因子随之漂移）。
+	// <=0 时退化为纯总量（expiring 恒 0）。
+	ExpiringSoonWindow time.Duration
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -430,20 +436,28 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}
-	remain, total, err := p.cfg.Upstream.UserResource(a)
+	// 顺带刷新最近到期展示态：签到刚发的新包（30 天）与快过期窗口一起重算。
+	sum, err := p.cfg.Upstream.UserResourceSummary(a, p.cfg.ExpiringSoonWindow)
 	if err != nil {
 		resp["balance_error"] = err.Error()
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
-	resp["credits"] = remain
-	resp["credits_total"] = total
-	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
+	p.cfg.Pool.SetCreditsSnapshot(uid, pool.CreditsSnapshot{
+		Remain:       sum.Remain,
+		Total:        sum.Total,
+		Expiring:     sum.Expiring,
+		ExpireAt:     sum.ExpireAt,
+		ExpireAmount: sum.ExpireAmount,
+	})
+	resp["credits"] = sum.Remain
+	resp["credits_total"] = sum.Total
+	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, sum.Remain, sum.Total)
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// accountBalance 单号余额刷新：UserResource → SetCredits（不触碰冷却状态）。
+// accountBalance 单号余额刷新：UserResourceSummary → SetCreditsSnapshot（NoRevive：
+// 只刷新观测量含「积分到期」，不触碰冷却状态）。
 func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.cfg.Pool.AuthByUID(uid)
@@ -451,13 +465,20 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	remain, total, err := p.cfg.Upstream.UserResource(a)
+	sum, err := p.cfg.Upstream.UserResourceSummary(a, p.cfg.ExpiringSoonWindow)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
 	}
-	p.cfg.Pool.SetCredits(uid, remain, total)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
+	p.cfg.Pool.SetCreditsSnapshot(uid, pool.CreditsSnapshot{
+		Remain:       sum.Remain,
+		Total:        sum.Total,
+		Expiring:     sum.Expiring,
+		ExpireAt:     sum.ExpireAt,
+		ExpireAmount: sum.ExpireAmount,
+		NoRevive:     true,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": sum.Remain, "credits_total": sum.Total})
 }
 
 // accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。
@@ -551,6 +572,9 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 // usage 返回逐请求用量聚合。hours 查询参数控制统计窗口（默认 72，上限 1440=60
 // 天）：卡片汇总/按域/按账号/按模型/时序**全部**按该窗口统计。显式 hours=0 表示
 // 全部历史（含 90 天前折叠出的日桶，看长期趋势）。
+// model / uid 是维度口径（下拉框「按模型/按账号看」）：都为空 = 全部；同时给出
+// 时按 AND。取值原样透给 usage.Filter 精确比对——前端下拉框的 value 就是桶里的
+// 原文（上游模型 id / uid），面板不做任何翻译或模糊匹配。
 func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Usage == nil {
 		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
@@ -572,7 +596,11 @@ func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 			nicks[s.UID] = s.Nickname
 		}
 	}
-	writeJSON(w, http.StatusOK, p.cfg.Usage.Snapshot(hours, nicks))
+	flt := usage.Filter{
+		Model: strings.TrimSpace(r.URL.Query().Get("model")),
+		UID:   strings.TrimSpace(r.URL.Query().Get("uid")),
+	}
+	writeJSON(w, http.StatusOK, p.cfg.Usage.SnapshotFiltered(hours, nicks, flt))
 }
 
 // usageSave 立即把内存中的用量桶落盘（正常由后台 30s 防抖刷新负责）。

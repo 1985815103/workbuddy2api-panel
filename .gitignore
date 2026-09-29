@@ -39,6 +39,11 @@ docs/
 /wb2api.exe
 /login.exe
 /credit.exe
+# 二进制备份（wb2api.exe.bak-* / .prev 等）
+/wb2api.exe.*
+
+# 运行日志（含账号 UID / 请求信息，绝不进库）
+/server.log
 
 # 本地验证工具（判据逆向过程脚本，结论沉淀于 data/desktop-task-protocol.md）
 /cmd/desktopverify*/

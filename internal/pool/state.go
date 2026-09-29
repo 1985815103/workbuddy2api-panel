@@ -169,8 +169,55 @@ func (p *Pool) NoteSuccess(uid string) {
 // credits 与 creditsExpiring，让选号余额因子随消耗实时收敛——旧口径只在签到
 // （每天 09:00/21:00 两次）刷新，两次签到之间（最长 12h）高消耗号持续高权重直到
 // 打空撞 402；global 账号不签到，credits 曾是终身冻结。签到仍定期覆盖
-// （ReenableIfCredits/SetCreditsDetailed 以 authoritative 余额重置），扣减只是
+// （ReenableIfCredits/SetCreditsSnapshot 以 authoritative 余额重置），扣减只是
 // 两次签到之间的内插估计；credit=0（免费请求）不动余额。
+// NoteRiskSignal 记录一次风控相关错误码（12153/14018/11102/6004/429/waf403/11140）。
+// 终身累计 + 首现/最近时刻，持久化（stateAccount.RiskSignals）——「上游是否开始
+// 对号动手」的唯一本地观测点：12153 连续出现 → Disable；waf403 频发 → 出口 IP
+// 已被盯上（多号同现即连坐预警）。只增不减，不做过期清理。
+func (p *Pool) NoteRiskSignal(uid, code string) {
+	if uid == "" || code == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	now := time.Now()
+	if e.risk == nil {
+		e.risk = make(map[string]riskSignal)
+	}
+	r := e.risk[code]
+	if r.FirstSeen.IsZero() {
+		r.FirstSeen = now
+	}
+	r.Count++
+	r.LastSeen = now
+	e.risk[code] = r
+	p.dirty.Store(true)
+}
+
+// riskSignalsStatusLocked 收集账号的风控信号台账（code 稳定排序）。
+// 调用方必须已持锁（statusOf 只读路径持 RLock，本函数只读不写）。
+func (p *Pool) riskSignalsStatusLocked(e *entry) []RiskSignalStatus {
+	if len(e.risk) == 0 {
+		return nil
+	}
+	codes := make([]string, 0, len(e.risk))
+	for c := range e.risk {
+		codes = append(codes, c)
+	}
+	sort.Strings(codes)
+	rows := make([]RiskSignalStatus, 0, len(codes))
+	for _, c := range codes {
+		r := e.risk[c]
+		rows = append(rows, RiskSignalStatus{Code: c, Count: r.Count, FirstSeen: r.FirstSeen, LastSeen: r.LastSeen})
+	}
+	return rows
+}
+
 func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	if uid == "" || model == "" || tokens <= 0 {
 		return
@@ -469,6 +516,8 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Nickname:          e.a.Nickname,
 		Credits:           e.credits,
 		CreditsTotal:      e.creditsTotal,
+		CreditsExpireAt:   e.creditsExpireAt,
+		CreditsExpireAmount: e.creditsExpireAmount,
 		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
 		Reason:            e.reason,
 		Disabled:          e.disabled,
@@ -480,6 +529,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Until:             e.until,
 		SoftStreak:        e.softStreak,
 		ModelCosts:        p.modelCostsStatusLocked(e, now),
+		RiskSignals:       p.riskSignalsStatusLocked(e),
 		ConsecutiveFails:  e.consecutiveFails,
 		DegradeUntil:      e.degradeUntil,
 		InFlight:          int(e.inFlight.Load()),

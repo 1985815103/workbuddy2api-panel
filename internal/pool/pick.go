@@ -38,7 +38,20 @@ func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm stri
 	return p.pick(tried, reqModel, realm)
 }
 
-// pick 在 healthy 候选集中按权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
+// selection 选号策略（策略模式，pool.selection 可切换，面板热生效）。
+// pick 在 p.mu 写锁内被调用，实现方不得再取锁；候选集已过健康/域/模型/在途过滤
+// 且保证非空。reqModel 供成本分层使用（weighted 需要，drain 忽略）。
+type selection interface {
+	name() string
+	pick(cands []*entry, reqModel, realm string, now time.Time) *entry
+}
+
+const (
+	SelectionWeighted = "weighted" // 三因子加权随机（缺省，打散热点）
+	SelectionDrain    = "drain"    // 同过期段串行耗尽（一次只重点用一个号）
+)
+
+// pick 在健康候选集中按当前策略选出账号，并记录 lastUsed（防并发撞号）。
 // reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效）。
 // realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域）。
 func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
@@ -72,6 +85,26 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
 		return p.pickEarliestExpiryLocked(tried, now, realm)
 	}
+	// 策略选择：候选集相同，怎么选交给策略（weighted 打散热点 / drain 串行耗尽）。
+	e := p.sel.pick(cands, reqModel, realm, now)
+	if e == nil {
+		e = cands[0] // 防御：策略契约是非空候选必返非 nil，此处兜底不择号失败
+	}
+	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
+	p.pickSeq++
+	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
+	return e.a
+}
+
+// weightedSel 三因子加权随机策略（原 pick() 主体的原样搬迁）：
+// healthy 候选中按权重取前 5 名，再在 Top5 内按同一权重加权随机抽签，
+// 意图是打散热点、多号并行，避免永远打同一个账号。
+type weightedSel struct{ p *Pool }
+
+func (weightedSel) name() string { return SelectionWeighted }
+
+func (s weightedSel) pick(cands []*entry, reqModel, realm string, now time.Time) *entry {
+	p := s.p
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
 	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
 	// maxCredits 统一用**全集口径**（tier 过滤前的全部 healthy 候选）：截断排序与
@@ -221,10 +254,56 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		log.Printf("[pool] cost explore model=%s realm=%q acct=%s window=%s",
 			reqModel, realm, logfmt.Label(e.a.UID, e.a.Nickname), p.costExploreInterval)
 	}
-	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
-	p.pickSeq++
-	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
-	return e.a
+	return e
+}
+
+// drainSel 串行耗尽策略（pool.selection="drain"）：同过期段内一次只重点用一个号。
+// 排序键 = (积分到期时刻升序[无到期观测排最后], 余额升序, uid)：
+//   - 到期最早的一段先用（奖励积分到期即作废，不用白不用）；
+//   - 同段内取余额最小者做「排水头」：它被持续消耗只会更小，排序稳定不翻转，
+//     直到耗尽进入硬冷却退出候选集，下一个才顶上——即「一个个来，中间不切号」。
+//
+// 与 weighted 的差别：不做 Top5 短名单、不做加权随机、不做成本分层与探索——
+// 那些机制的目的都是打散热点、多号并行，与串行耗尽正好相反。
+// 边界说明：本策略改变的是**真实使用节奏**（少号串行），不做任何身份/指纹层面的
+// 掩饰，也不改变"同一出口 IP 多账号"这一上游可见的事实。
+type drainSel struct{}
+
+func (drainSel) name() string { return SelectionDrain }
+
+func (drainSel) pick(cands []*entry, _, _ string, now time.Time) *entry {
+	best := cands[0]
+	for _, e := range cands[1:] {
+		if drainBefore(e, best) {
+			best = e
+		}
+	}
+	return best
+}
+
+// drainBefore 报告 a 是否应排在 b 之前（更早被轮到/耗尽）：
+// 先比到期时刻（早者先），再比余额（小者先耗尽），最后比 uid 保证确定性。
+func drainBefore(a, b *entry) bool {
+	ta, tb := drainExpire(a), drainExpire(b)
+	if !ta.Equal(tb) {
+		return ta.Before(tb)
+	}
+	if a.credits != b.credits {
+		return a.credits < b.credits
+	}
+	return a.a.UID < b.a.UID
+}
+
+// drainNoExpiry 无到期观测时的排序占位（遥远未来 = 排最后）。不能用零值 time：
+// time.Before 会把零值判成"最早"，语义正好反过来。
+var drainNoExpiry = time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC)
+
+// drainExpire 返回排序用的到期时刻；无观测（零值）用 drainNoExpiry 占位。
+func drainExpire(e *entry) time.Time {
+	if e.creditsExpireAt.IsZero() {
+		return drainNoExpiry
+	}
+	return e.creditsExpireAt
 }
 
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。

@@ -18,24 +18,60 @@ func (p *Pool) SetCredits(uid string, credits, total int64) {
 	}
 }
 
-// SetCreditsDetailed 更新账号余额/总额 + 快过架子集（签到与余额刷新时调用，
-// 供选号优先消耗快过期积分）。expiring 会被钳到 [0, credits]：上游分桶异常时
-// 不污染权重。
-func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64) {
+// CreditsSnapshot 一次 authoritative 余额查询的完整结果（签到 / 余额刷新）。
+// 是 upstream.ResourceSummary 在 pool 侧的对应物（此处不 import upstream，
+// 保持 pool 对上游无依赖）。
+type CreditsSnapshot struct {
+	Remain   int64 // 剩余积分
+	Total    int64 // 总额度；0 = 未知
+	Expiring int64 // 快过期子集（Remain 的一部分，写入前钳到 [0, Remain]）
+	// ExpireAt / ExpireAmount 最近一笔到期时刻 + 同自然日（UTC+8）到期合计。
+	// 纯展示字段（面板「积分到期」列），不参与选号——选号只读 Expiring 占比。
+	// 零值代表「无到期信息」，会覆盖清空旧值，不做"非零才更新"的保留。
+	ExpireAt     time.Time
+	ExpireAmount int64
+	// NoRevive 置 true 时只写入数值，不做「余额 > 0 即解冻」的冷却交互。
+	// 面板单号「余额」按钮的口径：只刷新观测量，不改变账号可用状态
+	// （避免运维点一下余额就把冷却/熔断中的号点亮）。
+	NoRevive bool
+}
+
+// SetCreditsSnapshot 以一次余额查询结果整体覆盖账号态：余额 / 总额 / 快过期子集 /
+// 最近到期展示态，并按「余额 > 0 且未禁用」自动解冻（reviveCoolingLocked，只清
+// 冷却域不动熔断，与 ReenableIfCredits 同语义）。
+//
+// 解冻判据只看余额，不看是否有快过期积分：此前调度侧按 `expiring > 0` 二选一
+// 调用（有快过期积分走本函数、否则走 ReenableIfCredits），导致「余额已恢复但仍有
+// 快过期积分」的账号不被解冻——与 README「余额恢复的冷却账号也会自动解冻」的
+// 既有语义相悖。本函数统一两条分支，该缺陷随之消失。
+func (p *Pool) SetCreditsSnapshot(uid string, s CreditsSnapshot) {
+	if s.Expiring < 0 {
+		s.Expiring = 0
+	}
+	if s.Expiring > s.Remain {
+		s.Expiring = s.Remain
+	}
+	if s.Remain <= 0 {
+		// 没余额就没有到期事件：清掉展示态，避免面板显示「0 分 / 昨天到期」。
+		s.ExpireAt = time.Time{}
+		s.ExpireAmount = 0
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		if expiring < 0 {
-			expiring = 0
-		}
-		if expiring > credits {
-			expiring = credits
-		}
-		e.credits = credits
-		e.creditsTotal = total
-		e.creditsExpiring = expiring
-		p.dirty.Store(true)
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
 	}
+	if s.Remain > 0 && !e.disabled && !s.NoRevive {
+		p.reviveCoolingLocked(e, s.Remain, s.Total)
+	} else {
+		e.credits = s.Remain
+		e.creditsTotal = s.Total
+	}
+	e.creditsExpiring = s.Expiring
+	e.creditsExpireAt = s.ExpireAt
+	e.creditsExpireAmount = s.ExpireAmount
+	p.dirty.Store(true)
 }
 
 // Cooldown 冷却账号至 now+d（即时冷却：CoolHard 余额耗尽 / CoolSoft 固定短冷却）。

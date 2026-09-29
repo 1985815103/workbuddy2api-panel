@@ -343,17 +343,22 @@ func (s *Scheduler) RunCheckinNow() {
 			}
 			// 其余业务错误也继续走余额查询
 		}
-		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗。
-		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
-		remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗；顺带记录最近到期
+		// 时刻（面板「积分到期」列）。ExpiringSoonWindow<=0 时 expiring 恒 0（纯总量）。
+		// 一次写入覆盖全部字段（含 expiring 归零），不再按 expiring>0 二选一调用——
+		// 那条老分支会让「余额恢复但仍有快过期积分」的号不被解冻。
+		sum, err := s.cfg.Upstream.UserResourceSummary(a, s.cfg.ExpiringSoonWindow)
 		if err != nil {
 			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			continue
 		}
-		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
-		if expiring > 0 {
-			s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring)
-		}
+		s.cfg.Pool.SetCreditsSnapshot(st.UID, pool.CreditsSnapshot{
+			Remain:       sum.Remain,
+			Total:        sum.Total,
+			Expiring:     sum.Expiring,
+			ExpireAt:     sum.ExpireAt,
+			ExpireAmount: sum.ExpireAmount,
+		})
 	}
 	s.RunStreakBonusNow()
 	s.RunSchoolNow() // 开学季活动（活动期 9/13-9/24，结束自动跳过）
@@ -467,16 +472,18 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
-			remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+			sum, err := s.cfg.Upstream.UserResourceSummary(a, s.cfg.ExpiringSoonWindow)
 			if err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
 				return
 			}
-			if expiring > 0 {
-				s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring)
-			} else {
-				s.cfg.Pool.ReenableIfCredits(uid, remain, total)
-			}
+			s.cfg.Pool.SetCreditsSnapshot(uid, pool.CreditsSnapshot{
+				Remain:       sum.Remain,
+				Total:        sum.Total,
+				Expiring:     sum.Expiring,
+				ExpireAt:     sum.ExpireAt,
+				ExpireAmount: sum.ExpireAmount,
+			})
 		}(a, st.UID)
 	}
 	wg.Wait()

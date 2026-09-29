@@ -158,6 +158,13 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			sessionDeadFails: s.SessionDeadFails,
 			consecutiveFails: s.ConsecutiveFails,
 		}
+		// 最近到期展示态：仅未过期才恢复（已过期的到期时刻没有展示意义，
+		// 恢复它会让面板显示一个「已作废却仍标着昨天」的陈旧日期；
+		// 重启用例下次余额刷新会重新填充）。
+		if s.CreditsExpireAt != nil && now.Before(*s.CreditsExpireAt) {
+			e.creditsExpireAt = *s.CreditsExpireAt
+			e.creditsExpireAmount = s.CreditsExpireAmount
+		}
 		// 熔断器持久化恢复：breakerUntil 未过期才恢复（过期不复活），retryCount 仅在
 		// 熔断仍有效时保留（否则归零，不保留无用退避指数）。
 		if s.BreakerUntil != nil && now.Before(*s.BreakerUntil) {
@@ -191,6 +198,16 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 					e.modelCost = map[string]modelCostEntry{}
 				}
 				e.modelCost[m] = modelCostEntry{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
+			}
+		}
+		// 风控信号台账：终身累计全量恢复（重启不清零——清零会抹掉「上游开始动手」的时间线）。
+		if len(s.RiskSignals) > 0 {
+			e.risk = make(map[string]riskSignal, len(s.RiskSignals))
+			for c, r := range s.RiskSignals {
+				if r.Count <= 0 || r.FirstSeen.IsZero() {
+					continue // 脏行不复活（次数/首现缺一律弃）
+				}
+				e.risk[c] = riskSignal{Count: r.Count, FirstSeen: r.FirstSeen, LastSeen: r.LastSeen}
 			}
 		}
 		p.byUID[uid] = e
@@ -282,6 +299,12 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			ConsecutiveFails: e.consecutiveFails,
 			CreditsExpiring:  e.creditsExpiring,
 		}
+		// 最近到期展示态：仅未过期才落盘（同 BreakerUntil 口径，过期不写）。
+		if !e.creditsExpireAt.IsZero() && now.Before(e.creditsExpireAt) {
+			u := e.creditsExpireAt
+			s.CreditsExpireAt = &u
+			s.CreditsExpireAmount = e.creditsExpireAmount
+		}
 		// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
 		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
 			u := e.breakerUntil
@@ -303,6 +326,14 @@ func (p *Pool) stateOverviewLocked() stateFile {
 					s.ModelCooldowns = map[string]stateModelCooldown{}
 				}
 				s.ModelCooldowns[m] = stateModelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason}
+			}
+		}
+		// 风控信号台账：终身累计，只增不减，全量落盘（重启不清零——清零会抹掉
+		// 「上游开始动手」的时间线证据）。
+		if len(e.risk) > 0 {
+			s.RiskSignals = make(map[string]stateRiskSignal, len(e.risk))
+			for c, r := range e.risk {
+				s.RiskSignals[c] = stateRiskSignal{Count: r.Count, FirstSeen: r.FirstSeen, LastSeen: r.LastSeen}
 			}
 		}
 		// 成本账本：惰性过滤过期观测（modelCostTTL 外不写——陈旧价格不复活）。

@@ -76,6 +76,11 @@ type chatStatsReader struct {
 	hasPromptTokens     bool
 	hasCompletionTokens bool
 	hasTotalTokens      bool
+	// cache 上游前缀缓存口径：命中/未命中的 prompt token。两者一起下发，故共用
+	// hasCacheTokens。面板据此解释「积分 ÷ 合计 token」跨模型差 10 倍以上。
+	hasCacheTokens  bool
+	cacheHitTokens  int
+	cacheMissTokens int
 	// credit 上游末帧 usage.credit（本次真实扣费积分），供成本台账（NoteModelCost）。
 	hasCredit bool
 	credit    float64
@@ -108,6 +113,11 @@ func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 		CompletionTokens:    int64(s.completionTokens),
 		HasTotalTokens:      s.hasTotalTokens,
 		TotalTokens:         int64(s.totalTokens),
+		HasCacheTokens:      s.hasCacheTokens,
+		CacheHitTokens:      int64(s.cacheHitTokens),
+		CacheMissTokens:     int64(s.cacheMissTokens),
+		HasCredit:           s.hasCredit,
+		Credit:              s.credit,
 	}
 }
 
@@ -131,6 +141,8 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			CompletionTokens *int     `json:"completion_tokens"`
 			TotalTokens      *int     `json:"total_tokens"`
 			Credit           *float64 `json:"credit"`
+			CacheHitTokens   *int     `json:"prompt_cache_hit_tokens"`
+			CacheMissTokens  *int     `json:"prompt_cache_miss_tokens"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
@@ -147,6 +159,12 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	if chunk.Usage.TotalTokens != nil {
 		s.hasTotalTokens = true
 		s.totalTokens = *chunk.Usage.TotalTokens
+	}
+	// 两者成对下发：只在一个到位时标记，避免把「上游没报」读成「命中 0」。
+	if chunk.Usage.CacheHitTokens != nil && chunk.Usage.CacheMissTokens != nil {
+		s.hasCacheTokens = true
+		s.cacheHitTokens = *chunk.Usage.CacheHitTokens
+		s.cacheMissTokens = *chunk.Usage.CacheMissTokens
 	}
 	if chunk.Usage.Credit != nil {
 		s.hasCredit = true
@@ -241,6 +259,17 @@ func usageDeltaFromResponse(resp map[string]any) pool.TokenUsageDelta {
 	if n, ok := read("total_tokens"); ok {
 		delta.HasTotalTokens, delta.TotalTokens = true, n
 	}
+	// credit 是浮点扣费积分（token 系列的 read 只认整数），单独按 float 取。
+	if c, ok := u["credit"].(float64); ok {
+		delta.HasCredit, delta.Credit = true, c
+	}
+	// 前缀缓存口径：两个字段成对采信（只报一个时按未上报处理，见 chatStatsReader）。
+	if hit, ok := read("prompt_cache_hit_tokens"); ok {
+		if miss, ok2 := read("prompt_cache_miss_tokens"); ok2 {
+			delta.HasCacheTokens = true
+			delta.CacheHitTokens, delta.CacheMissTokens = hit, miss
+		}
+	}
 	return delta
 }
 
@@ -278,13 +307,27 @@ const (
 	chatRateWidth = 11 // 形如 "183.6tok/s"
 )
 
+// 速率列可信度阈值（logChatRow 与 handler.recordAttempt 共用语义）：
+//   - rateMinGenWindow 生成窗口下限 500ms。低于此值的速率是「整包到达」假象
+//     （上游缓冲小响应、凑完才发，TTFB≈total，分母只剩几十毫秒）；
+//   - rateMinTokens 样本下限 30tok。token 太少时均值噪声大，且整包倒出场景
+//     常以小样本出现。
+//
+// 不满足时速率列显示 "-"（与 usage 缺失同形态）：不出数比出假数好。
+const (
+	rateMinGenWindow = 500 * time.Millisecond
+	rateMinTokens    = 30
+)
+
 // logChatRow 打印一行请求级表格日志（输出 chatLogOut，无 log 时间戳前缀）。
 //
 // 参数：
 //   - model：模型名（含 realm 前缀），超 chatModelWidth 截断（模型名是 ASCII，字节截即列宽）；
 //   - uid/nick：完整 uid 与账号昵称，经 logfmt.Label 拼成 "昵称(uid8)" 展示——只有
 //     uid8 时人眼无法判断是哪个号，要辨认必须再查 auths/，排障多一跳；
-//   - toks<0 表示 usage 缺失，显示 "-"。
+//   - toks<0 表示 usage 缺失，显示 "-";
+//   - tok/s 列是**解码速度**（toks ÷ (total−ttfb)），与 TTFB 列分开读首字延迟；
+//     窗口 < 500ms 或 toks < 30 的行不出数（显示 "-"，见 rateMin* 常量）。
 func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int) {
 	if !chatLogEnabled {
 		return
@@ -297,10 +340,19 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status
 	tokpsField := "-"
 	if toks >= 0 {
 		tokField = fmt.Sprintf("%d", toks)
-		if total > 0 {
-			tokpsField = fmt.Sprintf("%.1ftok/s", float64(toks)/total.Seconds())
-		} else {
-			tokpsField = "0.0tok/s"
+		// 速率分母用生成窗口（total − TTFB）而非总时长：首 token 延迟是上游
+		// prefill/思考等待，不是出字速度。此前按总时长算，短回复被 3~10s 的 TTFB
+		// 摊薄到十几 tok/s，与真实解码速度（实测 ~200tok/s）差近一个数量级，
+		// 误导「比官方慢」的判断。TTFB 缺失（-/0，同步模式）时回退总时长。
+		gen := total - ttfb
+		if ttfb <= 0 {
+			gen = total
+		}
+		// 可信度护栏：窗口过小（上游整包倒出，TTFB≈total）或样本过少时不出数——
+		// 小分母会把 39tok/26ms 算成 1500tok/s 的假象，比不出数更有害。
+		// 阈值：窗口 ≥ rateMinGenWindow 且 toks ≥ rateMinTokens 才显示。
+		if gen >= rateMinGenWindow && toks >= rateMinTokens {
+			tokpsField = fmt.Sprintf("%.1ftok/s", float64(toks)/gen.Seconds())
 		}
 	}
 	ttfbMS := "-"

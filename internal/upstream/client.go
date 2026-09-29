@@ -1740,6 +1740,10 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 					// 到期时间字段名在上游同时存在两种口径，都读，谁有值用谁。
 					ExpiredTime    string `json:"ExpiredTime"`
 					PackageEndTime string `json:"PackageEndTime"`
+					// CycleEndTime 是**上游实测唯一有值**的到期字段（ExpiredTime/
+					// PackageEndTime 恒空），与 UserResourceDetailed 的 expiring
+					// 分桶同源；不回退它，逐包到期时间会永远显示「无」。
+					CycleEndTime string `json:"CycleEndTime"`
 					// 发放时刻（epoch 毫秒）。
 					CreateTime     int64  `json:"CreateTime"`
 					PackageCode    string `json:"PackageCode"`
@@ -1762,10 +1766,16 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 			SubProductCode: p.SubProductCode,
 			SubProductName: p.SubProductName,
 		}
-		if p.ExpiredTime != "" {
+		// 到期字段优先级：ExpiredTime → PackageEndTime → CycleEndTime。
+		// 前两者上游恒空（实测），真正有值的是 CycleEndTime——不回退它，
+		// 「积分构成」的到期列永远显示「无到期」。
+		switch {
+		case p.ExpiredTime != "":
 			cp.EndTime = p.ExpiredTime
-		} else {
+		case p.PackageEndTime != "":
 			cp.EndTime = p.PackageEndTime
+		default:
+			cp.EndTime = p.CycleEndTime
 		}
 		// CreateTime 是 epoch 毫秒；0 表示上游没给，留空而不是伪造 1970。
 		if p.CreateTime > 0 {
@@ -1805,10 +1815,29 @@ func (c *Client) UserResource(a *auth.Auth) (remain, total int64, err error) {
 // packageEndLayout 上游套餐到期时间的墙钟格式（UTC+8，与 softRateResetLoc 同口径）。
 const packageEndLayout = "2006-01-02 15:04:05"
 
-// UserResourceDetailed 在 UserResource 基础上额外返回「快过期」积分子集：
-// soon > 0 且套餐 CycleEndTime 解析成功且到期时刻 ≤ now+soon 的余额计入 expiring
-// （pool 据此优先消耗，避免官方活动赠送的奖励积分到期作废）；soon ≤ 0 时 expiring
-// 恒 0（禁用分桶，行为与引入前一致）。expiring 是 remain 的一部分。
+// packageDayLayout 到期「自然日」的墙钟格式（UTC+8，与 packageEndLayout 同口径）。
+const packageDayLayout = "2006-01-02"
+
+// ResourceSummary 一次余额查询的聚合结果（含「最近到期」信息）。
+//
+// ExpireAt / ExpireAmount 是**纯展示**字段：回答「账上这些分最早什么时候开始作废」，
+// 供面板透出；不参与选号——选号只读 Expiring 占比（weightOf 第四因子），
+// 两者口径不要混用。
+type ResourceSummary struct {
+	Remain   int64
+	Total    int64
+	Expiring int64 // soon 窗口内的余额（Remain 的子集）；soon<=0 时恒 0
+	// ExpireAt 最近一笔到期时刻（有余额的套餐中 CycleEndTime 最早者）。
+	// 零值 = 无到期信息（无包 / 无余额 / CycleEndTime 全缺失或解析失败）。
+	ExpireAt time.Time
+	// ExpireAmount 与 ExpireAt 落在同一自然日（softRateResetLoc，UTC+8）的
+	// 到期积分合计。上游把同一批赠送拆成逐笔套餐（每笔到期时刻精确到秒），
+	// 按自然日聚合才能回答「那天总共会作废多少」——只看单笔会严重低估。
+	ExpireAmount int64
+}
+
+// UserResourceSummary 余额查询的完整形态：聚合 + 最近到期，是 UserResource 家族
+// 的单一事实来源。UserResource / UserResourceDetailed 都是它的薄包装。
 //
 // 到期时间判据是 CycleEndTime（上游实测：CN/global 两域字段全集均无 PackageEndTime，
 // 旧判据恒 miss 致 expiring 恒 0；CycleEndTime 是上游真实下发的到期时刻——
@@ -1817,7 +1846,7 @@ const packageEndLayout = "2006-01-02 15:04:05"
 // 单套餐取数统一调 packageRemainUsed（与 CreditPackages 同一事实来源，含 remain
 // 钳 [0,size] 与 used 修正；消除双份逻辑漂移——旧中间 switch 只钳负值，上游脏数据
 // CycleRemain>Size 时会高估）。
-func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, err error) {
+func (c *Client) UserResourceSummary(a *auth.Auth, soon time.Duration) (ResourceSummary, error) {
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -1829,7 +1858,7 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 	}
 	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
 	if err != nil {
-		return 0, 0, 0, err
+		return ResourceSummary{}, err
 	}
 	var resp struct {
 		Response struct {
@@ -1848,8 +1877,14 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, 0, 0, fmt.Errorf("resource parse: %w", err)
+		return ResourceSummary{}, fmt.Errorf("resource parse: %w", err)
 	}
+	var out ResourceSummary
+	type datedRemain struct {
+		day    string
+		remain int64
+	}
+	dated := make([]datedRemain, 0, len(resp.Response.Data.Accounts))
 	for _, acct := range resp.Response.Data.Accounts {
 		r, _, size := packageRemainUsed(respAccount{
 			CapacityRemain:      acct.CapacityRemain,
@@ -1865,18 +1900,47 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		if size < r {
 			size = r
 		}
-		remain += r
-		total += size
-		// 分桶：仅 soon>0 且能解析出有效到期时间、且确实在窗口内 → expiring。
-		if soon > 0 && r > 0 && acct.CycleEndTime != "" {
-			if end, perr := time.ParseInLocation(packageEndLayout, acct.CycleEndTime, softRateResetLoc); perr == nil {
-				if !end.After(now.Add(soon)) {
-					expiring += r
-				}
+		out.Remain += r
+		out.Total += size
+		// 无余额的包不产生到期事件（扣空的包留着 remain=0，不该主导「最早到期」）。
+		if r <= 0 || acct.CycleEndTime == "" {
+			continue
+		}
+		end, perr := time.ParseInLocation(packageEndLayout, acct.CycleEndTime, softRateResetLoc)
+		if perr != nil {
+			continue
+		}
+		// 分桶：仅 soon>0 且确实在窗口内 → expiring。
+		if soon > 0 && !end.After(now.Add(soon)) {
+			out.Expiring += r
+		}
+		if out.ExpireAt.IsZero() || end.Before(out.ExpireAt) {
+			out.ExpireAt = end
+		}
+		dated = append(dated, datedRemain{day: end.In(softRateResetLoc).Format(packageDayLayout), remain: r})
+	}
+	if !out.ExpireAt.IsZero() {
+		day := out.ExpireAt.In(softRateResetLoc).Format(packageDayLayout)
+		for _, d := range dated {
+			if d.day == day {
+				out.ExpireAmount += d.remain
 			}
 		}
 	}
-	return remain, total, expiring, nil
+	return out, nil
+}
+
+// UserResourceDetailed 在 UserResource 基础上额外返回「快过期」积分子集：
+// soon > 0 且套餐 CycleEndTime 解析成功且到期时刻 ≤ now+soon 的余额计入 expiring
+// （pool 据此优先消耗，避免官方活动赠送的奖励积分到期作废）；soon ≤ 0 时 expiring
+// 恒 0（禁用分桶，行为与引入前一致）。expiring 是 remain 的一部分。
+// 聚合口径见 UserResourceSummary（本函数只是它的三返回值包装）。
+func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, err error) {
+	s, err := c.UserResourceSummary(a, soon)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return s.Remain, s.Total, s.Expiring, nil
 }
 
 // respAccount 供 packageRemainUsed 解析的套餐字段（CreditPackages 的逐包结构同构）。

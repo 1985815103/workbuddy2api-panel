@@ -225,8 +225,12 @@ func TestChatNonStreamAggregates(t *testing.T) {
 		st.TokenUsage.PromptTokens != 1 || st.TokenUsage.CompletionTokens != 1 || st.TokenUsage.TotalTokens != 2 {
 		t.Errorf("token usage=%+v", st.TokenUsage)
 	}
-	if st.TokenUsage.LastLatencyMs < 1 || st.TokenUsage.LastTokensPerSecond == nil || *st.TokenUsage.LastTokensPerSecond <= 0 {
-		t.Errorf("latest performance=%+v", st.TokenUsage)
+	if st.TokenUsage.LastLatencyMs < 1 {
+		t.Errorf("latency should be recorded: %+v", st.TokenUsage)
+	}
+	// 可信度护栏：假上游样本 1tok/瞬时完成（窗口 <500ms 或 toks <30）→ 速率不出数。
+	if st.TokenUsage.LastTokensPerSecond != nil {
+		t.Errorf("rate should be suppressed for tiny sample: %+v", st.TokenUsage)
 	}
 }
 
@@ -259,8 +263,12 @@ func TestChatStreamPassthrough(t *testing.T) {
 		st.TokenUsage.PromptTokens != 1 || st.TokenUsage.CompletionTokens != 1 || st.TokenUsage.TotalTokens != 2 {
 		t.Errorf("token usage=%+v", st.TokenUsage)
 	}
-	if st.TokenUsage.LastLatencyMs < 1 || st.TokenUsage.LastTokensPerSecond == nil || *st.TokenUsage.LastTokensPerSecond <= 0 {
-		t.Errorf("latest performance=%+v", st.TokenUsage)
+	if st.TokenUsage.LastLatencyMs < 1 {
+		t.Errorf("latency should be recorded: %+v", st.TokenUsage)
+	}
+	// 可信度护栏：假上游样本 1tok/瞬时完成（窗口 <500ms 或 toks <30）→ 速率不出数。
+	if st.TokenUsage.LastTokensPerSecond != nil {
+		t.Errorf("rate should be suppressed for tiny sample: %+v", st.TokenUsage)
 	}
 }
 

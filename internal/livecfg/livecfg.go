@@ -13,11 +13,21 @@ import (
 	"time"
 )
 
+// PinnedAccount api_users 的一条绑定：某个 Bearer key 固定走某个账号。
+// UID 参与路由；Name 仅展示（日志/错误文案）。
+type PinnedAccount struct {
+	UID  string `json:"uid"`
+	Name string `json:"name,omitempty"`
+}
+
 // Snapshot 一次读取的不可变配置视图。
 type Snapshot struct {
 	APIKey               string        // 网关/面板共同鉴权密钥；空 = 不鉴权
 	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
 	SanitizeFingerprints bool          // 出站请求体指纹脱敏
+	// PinnedAccounts api_users 绑号表（key → 账号）：命中 key 的 /v1 请求只走绑定号。
+	// 与 APIKey 分开存放：admin key 不在表内，天然不带绑号语义（面板与 /status 仍只认 admin）。
+	PinnedAccounts map[string]PinnedAccount
 }
 
 // Holder 原子持有当前快照。

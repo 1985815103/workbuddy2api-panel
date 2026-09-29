@@ -30,7 +30,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.11.6-panel"
+const appVersion = "1.11.8-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -100,6 +100,10 @@ func main() {
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)                 // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+	// 选号策略（pool.selection：weighted | drain，面板保存配置热切换）。
+	if !p.SetSelection(cfg.Pool.Selection) {
+		log.Printf("WARN: pool.selection=%q 不是已知策略，保持 weighted", cfg.Pool.Selection)
+	}
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -219,6 +223,7 @@ func main() {
 		APIKey:               cfg.APIKey,
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
+		PinnedAccounts:       pinnedAccounts(cfg.APIUsers),
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -243,6 +248,9 @@ func main() {
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
 		ConfigPath: *cfgPath,
+		// 与 scheduler 同一快过期窗口：面板单号「签到/余额」刷新按此重算 expiring，
+		// 窗口不一致会把 pool 的快过期子集（选号第四因子）写歪。
+		ExpiringSoonWindow: cfg.ExpiringSoonDur,
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},
@@ -257,6 +265,7 @@ func main() {
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
+		APIUsers:     pinnedAccounts(cfg.APIUsers),
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
@@ -391,6 +400,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		APIKey:               newCfg.APIKey,
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
+		PinnedAccounts:       pinnedAccounts(newCfg.APIUsers),
 	})
 	up.SanitizeFingerprints = newCfg.Features.SanitizeBlacklistFingerprints
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
@@ -400,6 +410,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
 	p.SetCostExploreInterval(newCfg.CostExploreIntervalDur) // costTier 探索窗口热生效（0 关停）
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
+	p.SetSelection(newCfg.Pool.Selection) // 选号策略热切换（weighted | drain）
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
 		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,
@@ -408,6 +419,20 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 
 	return restartRequiredFields(newCfg), nil
+}
+
+// pinnedAccounts 把 config 的 api_users 表转成 livecfg 绑号表（key → 账号）。
+// 返回 nil 当表为空——与 Snapshot.PinnedAccounts 的零值语义一致，避免热更时
+// 把空表误存成非 nil 空 map（无实际差别，nil 语义更干净）。
+func pinnedAccounts(m map[string]APIUser) map[string]livecfg.PinnedAccount {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]livecfg.PinnedAccount, len(m))
+	for k, u := range m {
+		out[k] = livecfg.PinnedAccount{UID: u.UID, Name: u.Name}
+	}
+	return out
 }
 
 // restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段名。
