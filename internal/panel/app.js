@@ -1,13 +1,22 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
-const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
+const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme', LS_USGRAN = 'wb2api.usgran';
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
 
+/* 用量页的展示偏好：时序粒度 hour|day。放这里而不是用量段里：顶层 go(#usage)
+   会先于文件后半段执行，let 落在 TDZ 里被读到就是整页白屏（v1.11.3 的教训）。 */
+let usGran = localStorage.getItem(LS_USGRAN) === 'day' ? 'day' : 'hour';
+
 const $ = id => document.getElementById(id);
+
+/* riskQuietMs 轻量风控信号（6004/429/14018/11102）的展示静默期：
+   最近一次出现超过该时长后收进 "+N" 折叠角标，不再常驻风险列（重信号不受限）。
+   台账数据仍终身保留（tooltip 可查），这里只收展示噪音。 */
+const riskQuietMs = 7 * 24 * 3600 * 1000;
 
 /* ── 主题 ─────────────────────────────────────────────────────────── */
 /* 两态翻转（浅/深），首次访问跟随系统偏好；点击总是切换可见外观，符合直觉。 */
@@ -192,7 +201,7 @@ go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accou
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
@@ -225,18 +234,66 @@ function renderAccounts(list) {
         '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)).join('\n');
     }
     const frozen = s.disabled || cool > 0;
+    // 积分到期：最近一笔到期时刻 + 同一自然日到期合计（上游逐包 CycleEndTime 聚合，
+    // 纯展示字段，不参与选号）。零值 = 尚未刷新过余额（点「余额」或等 5 分钟自动刷新）。
+    // 就近着色：≤3 天标红、≤7 天标黄，其余弱化为灰。
+    const exp = s.credits_expire_at ? new Date(s.credits_expire_at) : null;
+    let expHtml = '<span style="color:var(--ink-3)">—</span>';
+    if (exp && exp.getTime() > 0) {
+      const expDays = (exp.getTime() - Date.now()) / 86400000;
+      const md = String(exp.getMonth() + 1).padStart(2, '0') + '-' + String(exp.getDate()).padStart(2, '0');
+      const expCol = expDays <= 3 ? 'var(--bad)' : (expDays <= 7 ? 'var(--warn)' : 'var(--ink-3)');
+      const expAmt = s.credits_expire_amount || 0;
+      const expTip = '最近到期 ' + exp.toLocaleString() + (expAmt ? '\n当日到期 ' + expAmt + ' 分' : '');
+      expHtml = '<span title="' + esc(expTip) + '" style="color:' + expCol + ';white-space:nowrap">' + md +
+        ' <em style="font-style:normal;opacity:.7;font-size:11px">' +
+        (expDays < 0 ? '已过期' : Math.ceil(expDays) + '天') + '</em>' +
+        (expAmt ? '<br><em style="font-style:normal;opacity:.7;font-size:11px">' + expAmt + ' 分</em>' : '') + '</span>';
+    }
+    // 风控信号：终身台账（12153 会话死 / 11140 授权封禁 / waf403 IP 维拦截 /
+    // 14018 积分耗尽 / 6004·429·11102 限流）。空 = 从未出现——区分「干净」与「没统计」。
+    // 分层展示：重信号（封号前兆）与新鲜轻信号常驻；静默超过 riskQuietDays 的轻信号
+    // 收进灰色 "+N" 折叠角标，不再常驻刷屏。台账数据只增不减，完整案底（首现/最近）
+    // 仍在 tooltip 里可查——隐藏的只是展示，不是记录。
+    let riskHtml = '<span style="color:var(--ink-3)">—</span>';
+    const rs = s.risk_signals || [];
+    if (rs.length) {
+      const riskHot = x => x.code === '12153' || x.code === '11140' || x.code === 'waf403';
+      const now = Date.now();
+      const isStale = x => !riskHot(x) &&
+        (now - new Date(x.last_seen || x.first_seen || 0).getTime()) > riskQuietMs;
+      const shown = rs.filter(x => !isStale(x));
+      const hidden = rs.filter(isStale);
+      const hot = shown.some(riskHot);
+      const tip = rs.map(x => x.code + ' ×' + x.count +
+        (x.first_seen ? '\n  首现 ' + new Date(x.first_seen).toLocaleString() : '') +
+        (x.last_seen ? '\n  最近 ' + new Date(x.last_seen).toLocaleString() : '')).join('\n');
+      const foldTip = hidden.length
+        ? '\n\n已收起（静默轻信号）：\n' + hidden.map(x => '  ' + x.code + ' ×' + x.count).join('\n')
+        : '';
+      riskHtml = '<span title="' + esc(tip + foldTip) + '" style="cursor:help;color:' +
+        (hot ? 'var(--bad)' : shown.length ? 'var(--warn)' : 'var(--ink-3)') + ';white-space:nowrap">' +
+        esc(shown.map(x => x.code + '×' + x.count).join(' ')) +
+        (hidden.length
+          ? (shown.length ? ' ' : '') + '<span style="color:var(--ink-3);opacity:.75">+' + hidden.length + '</span>'
+          : '') +
+        '</span>';
+    }
+
     const tu = s.token_usage || {};
     const req = tu.request_count || 0;
     const totalTok = formatTokenCount(tu.total_tokens);
     const totalTokUnit = totalTok === '—' ? '' : '<em>tok</em>';
     const latency = formatLatency(tu.last_latency_ms);
     const rate = formatRate(tu.last_tokens_per_second);
-    const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
+    const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / 解码 ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
+      '<td class="num">' + expHtml + '</td>' +
+      '<td class="num">' + riskHtml + '</td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
       '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
@@ -379,6 +436,82 @@ function rateCell(m) {
   return m.credits ? esc(m.credits) : '—';
 }
 
+/* 排序：模型 / 积分倍率两列表头可点，三态循环——降序 → 升序 → 默认（默认 = 上游
+   返回顺序）。点另一列即接管。倍率按**生效价**排（就是列里显示的大字，有折扣时即
+   折后价）——按牌价排会让带优惠的行与显示值错位，看着像排序失灵。取不到数值的行
+   （cn:auto 无倍率）恒沉底、不随升降翻转：「—」冒到首行比沉在末行更像坏了。 */
+let mdSort = { key: '', dir: '' };
+let mdCache = null;   // { list, probes }：翻排序不再打上游，只有「重新获取」才刷新
+
+function mdNextSort(cur, key) {
+  if (cur.key !== key) return { key: key, dir: 'desc' };
+  if (cur.dir === 'desc') return { key: key, dir: 'asc' };
+  return { key: '', dir: '' };
+}
+
+/* mdCreditValue 从上游倍率原文取数：'x0.29' / '0x' / 'x0.77 credits' 都取第一个数
+   （尾缀是上游偶发的脏值，如 kimi-k2.8-preview 的 "x0.77 credits"）。
+   无折扣时即牌价，有限时优惠时取生效价。取不到给 NaN，由 mdSortList 沉底。 */
+function mdCreditValue(m) {
+  const raw = (m.promo_factor != null && m.promo_credits) ? m.promo_credits : m.credits;
+  const mt = String(raw == null ? '' : raw).match(/\d+(?:\.\d+)?/);
+  return mt ? parseFloat(mt[0]) : NaN;
+}
+
+/* mdSortList 返回排好序的副本（不改原数组；默认态直接还原上游顺序）。
+   key='model' 按 id 排——表里加粗显示的就是 id；numeric 让 glm-5.2 排在 glm-5.10 前。 */
+function mdSortList(list, s) {
+  const out = list.slice();
+  if (!s || !s.key) return out;
+  const flip = s.dir === 'desc' ? -1 : 1;
+  if (s.key === 'credits') return out.sort((a, b) => {
+    const x = mdCreditValue(a), y = mdCreditValue(b), xn = isNaN(x), yn = isNaN(y);
+    if (xn || yn) return xn && yn ? 0 : (xn ? 1 : -1);
+    return (x - y) * flip;
+  });
+  return out.sort((a, b) => String(a.id || '').localeCompare(String(b.id || ''), 'zh-CN', { numeric: true }) * flip);
+}
+
+/* mdApplySortUI 表头三态：默认淡 ⇅ / 降序 ▼ / 升序 ▲，aria-sort 同步给读屏。 */
+function mdApplySortUI() {
+  document.querySelectorAll('#view-models th.sortable').forEach(th => {
+    const on = mdSort.key === th.dataset.sort;
+    th.classList.toggle('on', on);
+    th.classList.toggle('asc', on && mdSort.dir === 'asc');
+    th.setAttribute('aria-sort', on ? (mdSort.dir === 'asc' ? 'ascending' : 'descending') : 'none');
+  });
+}
+
+function renderModels() {
+  if (!mdCache) return;
+  const tb = $('mdBody');
+  const probes = mdCache.probes, probeKeys = Object.keys(probes);
+  const probeOf = id => probes[id] || probes[probeKeys.find(k => k.endsWith(':' + id))];
+  tb.innerHTML = mdSortList(mdCache.list, mdSort).map(m => {
+    const eff = (m.supported_efforts || []).slice();
+    if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
+    const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
+      : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
+    // 能力徽标：默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）
+    const caps = [];
+    if (m.is_default) caps.push('<span class="tag ok">默认</span>');
+    if (m.supports_tool_call) caps.push('<span class="tag warn">工具</span>');
+    if (m.supports_images) caps.push('<span class="tag warn">视觉</span>');
+    if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
+    const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
+    const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
+    return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
+      '<td class="num">' + rateCell(m) + '</td>' +
+      '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
+      '<td class="efs" style="white-space:normal">' + effs + '</td>' +
+      '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
+      outCell(m, probeOf(m.id)) + '</tr>';
+  }).join('');
+  const hit = mdCache.list.filter(m => probeOf(m.id)).length;
+  $('mdNote').textContent = mdCache.list.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
+  mdApplySortUI();
+}
+
 async function loadModels() {
   const tb = $('mdBody');
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
@@ -387,36 +520,18 @@ async function loadModels() {
     const [d, pr] = await Promise.all([api('models'), api('model_probes').catch(() => ({}))]);
     const list = d.models || [];
     if (!list.length) { tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>'; return; }
-    const probes = pr.probes || {};
-    const probeKeys = Object.keys(probes);
-    const probeOf = id => probes[id] || probes[probeKeys.find(k => k.endsWith(':' + id))];
-    tb.innerHTML = list.map(m => {
-      const eff = (m.supported_efforts || []).slice();
-      if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
-      const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
-        : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
-      // 能力徽标：默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）
-      const caps = [];
-      if (m.is_default) caps.push('<span class="tag ok">默认</span>');
-      if (m.supports_tool_call) caps.push('<span class="tag warn">工具</span>');
-      if (m.supports_images) caps.push('<span class="tag warn">视觉</span>');
-      if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
-      const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
-      const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
-      return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
-        '<td class="num">' + rateCell(m) + '</td>' +
-        '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
-        '<td class="efs" style="white-space:normal">' + effs + '</td>' +
-        '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
-        outCell(m, probeOf(m.id)) + '</tr>';
-    }).join('');
-    const hit = list.filter(m => probeOf(m.id)).length;
-    $('mdNote').textContent = list.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
+    mdCache = { list: list, probes: pr.probes || {} };
+    renderModels();
   } catch (e) {
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
   }
 }
 $('btnModels').onclick = loadModels;
+document.querySelectorAll('#view-models th.sortable').forEach(th => {
+  const b = th.querySelector('button');
+  // 表头缺按钮时不绑（宁可少个交互，也不要在顶层抛异常白屏）
+  if (b) b.onclick = () => { mdSort = mdNextSort(mdSort, th.dataset.sort); renderModels(); };
+});
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
 let logCh = 'all';
@@ -529,6 +644,7 @@ const CFG_MAP = {
   degrade_cooldown_max: ['pool', 'degrade_cooldown_max'],
   cost_explore_interval: ['pool', 'cost_explore_interval'],
   prefer_expiring: ['pool', 'prefer_expiring'], expiring_soon: ['pool', 'expiring_soon'],
+  selection: ['pool', 'selection'],
   soft_rate: ['cooldown', 'soft_rate'], soft_rate_max: ['cooldown', 'soft_rate_max'],
   breaker_cooldown: ['pool', 'breaker_cooldown'], breaker_cooldown_max: ['pool', 'breaker_cooldown_max'],
   idle_weight_per_hour: ['pool', 'idle_weight_per_hour'], idle_weight_max: ['pool', 'idle_weight_max'],
@@ -1357,6 +1473,47 @@ function fmtModelRate(rate) {
   return s ? 'x' + s : '—';
 }
 
+/* fmtCr 积分消耗格式化：小值保 2 位小数，大值收整；配合样本数判空由调用方负责。 */
+function fmtCr(v) {
+  v = Number(v || 0);
+  if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M';
+  if (v >= 1e4) return Math.round(v).toLocaleString();
+  return +v.toFixed(2);
+}
+
+/* fmtHit 前缀缓存命中率 = 命中 ÷ (命中 + 未命中)。无样本（上游未下发该字段，或窗口内
+   只有失败尝试）显示 —，绝不显示 0%——「全未命中」与「没数据」必须能分开读。
+
+   为什么必须有这一列：「合计」把缓存命中的 token 和全价未命中的 token 同权相加，
+   而积分只反映后者的费用，于是「积分 ÷ 合计」在同一张表里跨模型不可比。实测
+   deepseek-v4.1-flash 的命中 token 完全免费、glm-5.3 约为全价 25%，两条真实流量的
+   命中率又差一截，最终同一份盘面倍率（差 7.2 倍）读出 72 倍积分差。 */
+function fmtHit(a) {
+  if (!a.cache_samples || !(Number(a.cache_hit_tokens || 0) + Number(a.cache_miss_tokens || 0))) return '—';
+  return (Number(a.cache_hit_rate || 0) * 100).toFixed(1) + '%';
+}
+
+/* fmtUnit 实付单价（credits / 1M 合计 token）：把「积分」按 token 归一后跨模型可比。
+   小值（deepseek-v4.1-flash 级 0.9）与大值（glm-5.3 级 160）都保 2 位小数，两列并排好读。
+   它仍是**实付**价而非牌价：值本身随缓存命中率浮动，故与命中率列连看才有意义。 */
+function fmtUnit(a) {
+  if (!a.credit_samples || !Number(a.total_tokens || 0)) return '—';
+  const v = Number(a.credits || 0) / Number(a.total_tokens) * 1e6;
+  return v >= 100 ? v.toFixed(0) : v.toFixed(2);
+}
+
+function usCacheTip(a) {
+  if (!a.cache_samples) return '上游未下发前缀缓存口径（该字段较新，旧请求与失败尝试没有）';
+  return '缓存命中 ' + fmtTok(a.cache_hit_tokens) + ' / 未命中 ' + fmtTok(a.cache_miss_tokens) +
+    '（' + a.cache_samples + ' 次上报）\n命中 token 计价远低于全价：实测 deepseek-v4.1-flash 免费、glm-5.3 约全价 25%';
+}
+
+function usUnitTip(a) {
+  if (!a.credit_samples) return '未上报 credit';
+  return '实测扣费 ÷ 合计 token × 1e6（credits/1M tokens）\n' +
+    '受缓存命中率影响：同一模型换账号也能差数倍，比较时连看命中率列';
+}
+
 function usStat(v, k, cls) {
   return '<div class="stat ' + (cls || '') + '"><div class="v">' + esc(v) +
          '</div><div class="k">' + esc(k) + '</div></div>';
@@ -1385,6 +1542,10 @@ function usRow(name, sub, a, mid, withPerf) {
     '<td class="num">' + fmtTok(a.prompt_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.completion_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.total_tokens) + '</td>' +
+    '<td class="num" title="' + (a.credit_samples ? esc(fmtCr(a.credits) + ' 积分 / ' + a.credit_samples + ' 次上报') : '未上报 credit') + '">' +
+      (a.credit_samples ? fmtCr(a.credits) : '—') + '</td>' +
+    '<td class="num" title="' + esc(usCacheTip(a)) + '">' + fmtHit(a) + '</td>' +
+    '<td class="num" title="' + esc(usUnitTip(a)) + '">' + fmtUnit(a) + '</td>' +
     (withPerf
       ? '<td class="num">' + fmtMs(a.avg_latency_ms) + '</td>' +
         '<td class="num">' + fmtRate(a.avg_tokens_per_second) + '</td>'
@@ -1397,34 +1558,56 @@ function renderUsage(d) {
   $('usStats').innerHTML =
     usStat(fmtTok(t.requests), '请求数') +
     usStat(fmtTok(t.total_tokens), '总 token') +
+    usStat(t.credit_samples ? fmtCr(t.credits) : '—', '积分消耗') +
+    usStat(t.cache_samples ? fmtHit(t) : '—', '缓存命中') +
     usStat(fmtTok(t.prompt_tokens), 'prompt') +
     usStat(fmtTok(t.completion_tokens), 'completion') +
     usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
     usStat(fmtMs(t.avg_latency_ms), '平均延迟');
 
+  syncUsageDims(d);
+
   // 卡片、三张表与时序图全部按所选窗口统计（切窗口数字随之变化）；
   // 「全部历史」含 90 天前折叠出的日桶。这里标注当前口径与数据起点。
-  const winLabel = ($('usWindow') && $('usWindow').selectedOptions[0]) ?
-    $('usWindow').selectedOptions[0].textContent.trim() : '';
+  const hours = ($('usWindow') && $('usWindow').value) || 72;
+  const dayMode = usGran === 'day';
+  const series = dayMode ? dailyWindow(d.daily || [], hours) : (d.series || []);
+  const scope = usageScopeLabel();
+  // 头部一行要放下标题 + 说明 + 三个下拉 + 刷新，说明只留"当前口径"，长解释走
+  // title（悬停可见）——塞不下时 CSS 让它省略号收尾，而不是把标题挤成竖排。
+  // 按天视图写**实际范围**（自哪天 00:00 起），而不是选择器的字面标签：整日口径
+  // 下「近 24 小时」的真实范围是今天，说清楚范围才能和卡片/表对上账。
+  const dayStart = dayMode ? dayWindowStart(hours) : null;
+  const dayCount = dayWindowDays(hours);
   $('usNote').textContent =
-    (winLabel ? winLabel + ' · ' : '') +
-    (d.buckets || 0) + ' 个分桶' +
+    (dayMode
+      ? (dayStart
+          ? '按天 ' + dayCount + ' 天 · 自 ' +
+            String(dayStart.getMonth() + 1).padStart(2, '0') + '-' +
+            String(dayStart.getDate()).padStart(2, '0') + ' 00:00 起'
+          : '按天 · 全部历史')
+      : ((($('usWindow') && $('usWindow').selectedOptions[0])
+          ? $('usWindow').selectedOptions[0].textContent.trim() + ' · ' : '') +
+         (d.buckets || 0) + ' 个分桶')) +
+    (scope ? ' · 口径 ' + scope : '') +
     (d.since ? ' · 数据自 ' + d.since.replace('T', ' ') : '') +
     (d.file_bytes ? ' · 文件 ' + (d.file_bytes / 1024).toFixed(1) + ' KB' : '');
+  $('usNote').title = '积分=实测扣费（未上报 credit 的请求不计）· 命中率/实付=上游前缀缓存口径' +
+    (dayMode ? ' · 按天视图按整日口径统计，与下方卡片/表格同一批桶（合计相等）' : '');
 
   $('usAccBody').innerHTML = (d.by_account || []).map(x =>
     usRow(x.key.slice(0, 8), x.extra || '', x,
       '<td class="num">' + esc(x.realm || '') + '</td>', true)
-  ).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
+  ).join('') || '<tr><td colspan="13" class="empty">暂无数据</td></tr>';
 
   $('usModelBody').innerHTML = (d.by_model || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
 
   $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
 
   renderCreditDimensions(d);
-  renderUsageChart(d.series || []);
+  renderUsageChart(series, usGran);
 }
 
 function renderCreditDimensions(d) {
@@ -1466,7 +1649,41 @@ function renderCreditDimensions(d) {
   ).join('') || '<tr><td colspan="7" class="empty">暂无积分扣除记录；升级前仅含 Token 的历史不会伪造积分。</td></tr>';
 }
 
-/* renderUsageChart 画堆叠柱状图。
+/* syncUsageDims 用后端给的全量维度刷新两个下拉框。
+   选项由后端保证不受当前口径与窗口影响（选中项不会因"这个窗口里没数据"而
+   消失），所以这里只需保留已选值：值在选项里就继续选中，不在就自动回落到
+   「全部」。账号文案用「昵称 + uid 前 8 位」，与「按账号」表同一口径。 */
+function syncUsageDims(d) {
+  const m = $('usModel');
+  if (m) {
+    const cur = m.value;
+    m.innerHTML = '<option value="">全部模型</option>' + (d.models || []).map(x =>
+      '<option value="' + esc(x) + '">' + esc(x) + '</option>').join('');
+    m.value = cur;
+  }
+  const a = $('usAccount');
+  if (a) {
+    const cur = a.value;
+    a.innerHTML = '<option value="">全部账号</option>' + (d.accounts || []).map(x =>
+      '<option value="' + esc(x.uid) + '">' +
+      esc((x.nickname || '(无昵称)') + ' ' + String(x.uid || '').slice(0, 8)) + '</option>').join('');
+    a.value = cur;
+  }
+}
+
+/* usageScopeLabel 当前维度口径的展示文案（空 = 不限）。 */
+function usageScopeLabel() {
+  const parts = [];
+  const m = $('usModel'), a = $('usAccount');
+  if (m && m.value) parts.push('模型 ' + m.value);
+  if (a && a.value) {
+    const opt = a.selectedOptions && a.selectedOptions[0];
+    parts.push('账号 ' + (opt ? opt.textContent.trim() : String(a.value).slice(0, 8)));
+  }
+  return parts.join(' · ');
+}
+
+/* renderUsageChart 画堆叠柱状图（prompt/completion）+ 积分折线。
  *
  * x 轴是**真实时间轴**，不是按序号等距。这一点很重要：数据里存在 1 小时的
  * 间隔，也存在 6~8 小时的断档（没请求的时段不产生桶），等距排布会把 8 小时
@@ -1477,6 +1694,10 @@ function renderCreditDimensions(d) {
  *
  * 时间轴用本地时间解析（后端返回的就是本地时区），day 点按当天 00:00 参与定位，
  * 与 hour 点在同一个连续轴上——日桶本来就是他那天所有小时的聚合。
+ *
+ * mode='day' 时序列来自 dailyWindow（整日口径），每根柱子就是一个自然日：
+ * 不画跨天分隔线（每天都是新的一天，画出来就是一层栅格噪音），柱子也允许更宽
+ * （窗口窄时 3~7 天要占满图宽，不然看着像"没数据"）。
  */
 
 /* parsePointTime 把后端的 t 解析成毫秒时间戳。 */
@@ -1487,42 +1708,121 @@ function parsePointTime(p) {
   return isNaN(d.getTime()) ? null : d.getTime();
 }
 
-function renderUsageChart(series) {
-  const host = $('usChart');
-
-  // 丢掉时间解析不出来的点，而不是让 NaN 传染整张图。
-  const pts = [];
-  for (const p of series) {
+/* usagePoints 把后端时序点转成绘图数据；时间解析不出来的点直接丢掉，
+   而不是让 NaN 传染整张图。 */
+function usagePoints(series) {
+  const out = [];
+  for (const p of (series || [])) {
     const t = parsePointTime(p);
     if (t === null) continue;
     const pt = Number(p.prompt_tokens || 0);
     const ct = Number(p.completion_tokens || 0);
-    pts.push({ t, scope: p.scope, raw: p.t, pt, ct, tt: Number(p.total_tokens || 0) || (pt + ct),
-               req: p.requests || 0 });
+    out.push({ t, scope: p.scope, raw: p.t, pt, ct,
+               tt: Number(p.total_tokens || 0) || (pt + ct),
+               req: p.requests || 0, cr: Number(p.credits || 0),
+               crn: Number(p.credit_samples || 0) });
   }
+  return out;
+}
+
+/* dayWindowDays 选择器的小时数 → 按天视图的整日天数（近 N 小时 = 含今天在内的
+   ceil(N/24) 个自然日；0 = 全部历史，返回 0）。dailyWindow / dayWindowStart /
+   说明行的天数都用它，保证三个地方口径不漂。 */
+function dayWindowDays(hours) {
+  const h = Number(hours) || 0;
+  if (h <= 0) return 0;
+  return Math.max(1, Math.ceil(h / 24));
+}
+
+/* dayWindowStart 按天视图窗口的起点（本地午夜）；全部历史返回 null。 */
+function dayWindowStart(hours) {
+  const days = dayWindowDays(hours);
+  if (!days) return null;
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - (days - 1));
+  return d;
+}
+
+/* dayWindowHours 把窗口选择器的值换算成「从第 N 个自然日 00:00 起」的整点小时数，
+   发给后端。
+   后端只认 [当前整点-(hours-1), now] 这种滚动窗，而按天图要整日口径——午夜正好
+   落在整点上，所以把"距午夜多少整点"算准、+1 发过去，后端的裁剪线就恰好是当天
+   00:00：卡片、三张表、按天图因此拿到**同一批桶**，合计必然相等。
+   （曾出现的矛盾：按天图整日裁、卡片/表滚动 24h 裁，同一页面两个范围——图显示
+   今天 636M，按账号表求和 1037M，看着像表格算错。） */
+function dayWindowHours(hours) {
+  const start = dayWindowStart(hours);
+  if (!start) return 0;
+  const nowHour = new Date();
+  nowHour.setMinutes(0, 0, 0);
+  return Math.max(1, Math.round((nowHour - start) / 3600000) + 1);
+}
+
+/* dailyWindow 把全量日序列裁到所选窗口的**整日**口径：近 N 小时 → 含今天在内
+   的 ceil(N/24) 个自然日；hours=0（全部历史）原样返回。
+   为什么按整日：日粒度下「近 3 天」只可能指 3 个自然日。若跟着小时窗口的半截
+   起点（如 09-25 16:00）裁，首日会被截成 8 小时却和整日并排显示，读图时会把
+   「今天还没用完」误读成「用量掉了」。今天本身是自然日的一部分，照常参与。
+   配套 dayWindowHours：后端窗口也被换算到同一条午夜边界，所以这里裁出来的日点
+   与卡片/表的桶集合一致。 */
+function dailyWindow(daily, hours) {
+  const list = daily || [];
+  const days = dayWindowDays(hours);
+  if (!days) return list;
+  const from = dayWindowStart(hours).getTime();
+  return list.filter(p => {
+    const t = parsePointTime(p);
+    return t !== null && t >= from;
+  });
+}
+
+function renderUsageChart(series, mode) {
+  $('usChart').innerHTML = usageChartHTML(series, mode);
+}
+
+/* usageChartHTML 生成时序图的 HTML（无数据时是空态提示）。
+   单独抽出来是为了可测：柱子与 <title> 的**嵌套关系**、"按天不画跨天分隔线"
+   这类结构性约定，语法检查、顶层冒烟、乃至肉眼都很难发现（v1.11.8 的提示 bug
+   就是 <title> 挂错层级导致悬停任意柱子都弹第一根的信息）。 */
+function usageChartHTML(series, mode) {
+  const pts = usagePoints(series);
+  const day = mode === 'day';
   if (!pts.length) {
-    host.innerHTML = '<div class="us-empty">暂无用量数据。发起一次对话后再刷新。</div>';
-    return;
+    return '<div class="us-empty">' +
+      (day ? '该窗口内没有按天的用量数据（按天取的是整日口径）。'
+           : '暂无用量数据。发起一次对话后再刷新。') + '</div>';
   }
 
-  const W = 760, H = 180, PL = 52, PR = 12, PT = 12, PB = 30;
+  const W = 760, H = 180, PR = 12, PT = 12, PB = 30;
+  const max = Math.max(1, ...pts.map(p => p.tt));
+  // 左侧留白按最长刻度标签算：「183.12M」这种 7 字符标签在固定 52 宽下只剩几像素
+  // 富余，再长一位就被 SVG 视口裁掉尾巴——而视口又按容器宽度等比放大，裁掉的量
+  // 跟着放大。10px 等宽字约 6.1px/字符。
+  const yTicks = [];
+  for (let i = 0; i <= 4; i++) yTicks.push(fmtTok(max * i / 4));
+  const PL = Math.max(34, Math.ceil(8 + Math.max(...yTicks.map(s => s.length)) * 6.1));
   const iw = W - PL - PR, ih = H - PT - PB;
 
   const t0 = pts[0].t;
   const t1 = pts[pts.length - 1].t;
   const span = Math.max(1, t1 - t0);
 
-  const max = Math.max(1, ...pts.map(p => p.tt));
-
   // 柱宽取「最小真实间隔」的 70%，并夹在合理区间内——窗口拉到 30 天时柱子会
-  // 变细，但不会细到看不见。
+  // 变细，但不会细到看不见；按天视图点数少，上限放宽到 46，免得 3 天只占中间
+  // 一小条。
   let minGap = Infinity;
   for (let i = 1; i < pts.length; i++) minGap = Math.min(minGap, pts[i].t - pts[i - 1].t);
   if (!isFinite(minGap) || minGap <= 0) minGap = span;
   const slot = iw * (minGap / span);
-  const bw = Math.max(1.5, Math.min(30, slot * 0.7));
+  const bw = Math.max(1.5, Math.min(day ? 46 : 30, slot * 0.7));
 
-  const xOf = t => PL + (t - t0) / span * iw;
+  // 时间轴映射到「柱心带」：两侧各留半个柱宽，首末柱整个落在内框里。直接映射到
+  // [PL, W-PR] 时首柱的左半截会伸进左侧刻度区，把「366.25M」盖成「366.」——
+  // 柱是按天/按小时逐个画的，柱越宽盖得越多（按天 46px 时几乎盖掉整段标签）。
+  const single = pts.length === 1;
+  const bandL = PL + bw / 2, bandR = W - PR - bw / 2;
+  const xOf = t => single ? (PL + W - PR) / 2 : bandL + (t - t0) / span * (bandR - bandL);
 
   let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" ' +
             'preserveAspectRatio="xMidYMid meet">';
@@ -1533,7 +1833,7 @@ function renderUsageChart(series) {
     out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
            '" y2="' + y.toFixed(1) + '"/>';
     out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) +
-           '" text-anchor="end">' + fmtTok(max * i / 4) + '</text>';
+           '" text-anchor="end">' + esc(yTicks[i]) + '</text>';
   }
 
   // 柱子
@@ -1544,14 +1844,36 @@ function renderUsageChart(series) {
     const hP = p.tt ? hTot * (p.pt / p.tt) : 0;
     const hC = Math.max(p.tt && p.ct ? 1 : 0, hTot - hP);
     const yBase = PT + ih;
-    if (hP > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP).toFixed(2) +
+    let bar = '';
+    if (hP > 0) bar += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP).toFixed(2) +
       '" width="' + bw.toFixed(2) + '" height="' + hP.toFixed(2) +
       '" fill="var(--accent)" rx="1.5"/>';
-    if (hC > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP - hC).toFixed(2) +
+    if (hC > 0) bar += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP - hC).toFixed(2) +
       '" width="' + bw.toFixed(2) + '" height="' + hC.toFixed(2) +
       '" fill="var(--ok)" rx="1.5"/>';
-    out += '<title>' + esc(p.raw) + '  ' + fmtTok(p.pt) + ' prompt / ' +
-           fmtTok(p.ct) + ' completion / ' + p.req + ' 次</title>';
+    // 全是失败尝试的分片没有任何 token，连柱子都没有——留一条贴地的透明命中条，
+    // 否则"这一格到底有没有请求"在图上看不出来（悬停能读到次数与失败语义）。
+    if (!bar && p.req) bar += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - 2).toFixed(2) +
+      '" width="' + bw.toFixed(2) + '" height="2" fill="transparent"/>';
+    // <title> 必须是柱子的**子节点**才成为该柱的提示：直接挂在 <svg> 下时浏览器
+    // 把第一条当作整个 SVG 的标题，于是悬停任意柱子都只弹第一根的信息（一直如此，
+    // 按小时的窄柱不易察觉，按天的宽柱一眼就穿帮）。
+    if (bar) out += '<g>' + bar + '<title>' + esc(p.raw) + '  ' + fmtTok(p.pt) + ' prompt / ' +
+      fmtTok(p.ct) + ' completion / ' + p.req + ' 次' +
+      (p.crn ? ' / ' + fmtCr(p.cr) + ' 积分' : '') + '</title></g>';
+  }
+
+  // 积分消耗折线：量纲与 token 不同，用独立刻度（贴满内框高度），右上角标注
+  // 折线峰值当刻度锚点。仅在窗口内出现过非零扣费时画——全 0/无上报时一条贴地
+  // 零线只是噪音，还不如让图例保持安静。
+  const crMax = Math.max(0, ...pts.map(p => p.cr));
+  if (crMax > 0) {
+    const crY = c => PT + ih - (c / crMax) * ih;
+    out += '<polyline fill="none" stroke="var(--warn)" stroke-width="1.5" ' +
+           'stroke-dasharray="4 3" points="' +
+           pts.map(p => xOf(p.t).toFixed(1) + ',' + crY(p.cr).toFixed(1)).join(' ') + '"/>';
+    out += '<text class="tk" x="' + (W - PR) + '" y="' + (PT + 8) + '" text-anchor="end">' +
+           esc(fmtCr(crMax)) + ' 分</text>';
   }
 
   // x 轴基线画在柱子之后，避免压在柱底
@@ -1583,20 +1905,23 @@ function renderUsageChart(series) {
            '" y="' + (PT + ih + 15) + '" text-anchor="' + anchor + '">' + esc(lab) + '</text>';
   }
 
-  // 跨天时补一条日期分隔线，让「日界」在长窗口里可见
-  let prevDay = null;
-  for (const p of pts) {
-    const d = new Date(p.t).getDate();
-    if (prevDay !== null && d !== prevDay) {
-      const x = xOf(p.t).toFixed(1);
-      out += '<line class="gl" x1="' + x + '" y1="' + PT + '" x2="' + x + '" y2="' +
-             (PT + ih) + '" style="opacity:.45"/>';
+  // 跨天时补一条日期分隔线，让「日界」在长窗口里可见。按天视图里每根柱子就是
+  // 一天，这条线会变成一层栅格噪音，故只在按小时视图画。
+  if (!day) {
+    let prevDay = null;
+    for (const p of pts) {
+      const d = new Date(p.t).getDate();
+      if (prevDay !== null && d !== prevDay) {
+        const x = xOf(p.t).toFixed(1);
+        out += '<line class="gl" x1="' + x + '" y1="' + PT + '" x2="' + x + '" y2="' +
+               (PT + ih) + '" style="opacity:.45"/>';
+      }
+      prevDay = d;
     }
-    prevDay = d;
   }
 
   out += '</svg>';
-  host.innerHTML = out;
+  return out;
 }
 
 function fmtTokTip(v) { return fmtTok(v); }
@@ -1613,10 +1938,18 @@ async function warmUsageModelRates() {
 }
 
 async function loadUsage() {
-  const hours = ($('usWindow') && $('usWindow').value) || 72;
+  const sel = ($('usWindow') && $('usWindow').value) || 72;
+  // 按天视图发换算后的整点小时数（落到午夜边界），让卡片/三张表与按天图拿同一批
+  // 桶；选中值本身不动——dailyWindow 仍按同一个 sel 推整日，两边天然对齐。
+  const hours = usGran === 'day' ? dayWindowHours(sel) : sel;
+  const q = ['hours=' + encodeURIComponent(hours)];
+  const m = $('usModel'), a = $('usAccount');
+  // 维度口径直接透传下拉框的 value（上游模型 id / uid 原文），后端精确比对。
+  if (m && m.value) q.push('model=' + encodeURIComponent(m.value));
+  if (a && a.value) q.push('uid=' + encodeURIComponent(a.value));
   try {
     await warmUsageModelRates();
-    const d = await api('usage?hours=' + encodeURIComponent(hours));
+    const d = await api('usage?' + q.join('&'));
     renderUsage(d);
   } catch (e) {
     $('usChart').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
@@ -1625,6 +1958,39 @@ async function loadUsage() {
 
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
 if ($('usWindow')) $('usWindow').onchange = loadUsage;
+if ($('usModel')) $('usModel').onchange = loadUsage;
+if ($('usAccount')) $('usAccount').onchange = loadUsage;
+
+/* syncUsageWindowLabel 按天口径下「近 24 小时」这个字面量是误导的：整日窗口里它
+   实际就是「今天」。其余选项（近3天/近7天…）按整日本来就通顺，不动。 */
+function syncUsageWindowLabel() {
+  const w = $('usWindow');
+  if (!w || !w.querySelector) return;
+  const o = w.querySelector('option[value="24"]');
+  if (o) o.textContent = usGran === 'day' ? '今天' : '近 24 小时';
+}
+
+/* 粒度切换必须重新取数：粒度决定请求的窗口口径（小时=滚动 / 天=午夜整日边界），
+   只在本地重画会把上一个口径的卡片与三张表留在页面上。窗口/维度下拉同理走
+   loadUsage。 */
+if ($('usGran')) {
+  const markGran = () => {
+    document.querySelectorAll('#usGran .chip')
+      .forEach(c => c.classList.toggle('on', c.dataset.gran === usGran));
+    syncUsageWindowLabel();
+  };
+  markGran();
+  $('usGran').addEventListener('click', ev => {
+    const b = ev.target.closest('button[data-gran]');
+    if (!b || !b.dataset.gran || b.dataset.gran === usGran) return;
+    usGran = b.dataset.gran;
+    localStorage.setItem(LS_USGRAN, usGran);
+    markGran();
+    // 粒度决定窗口口径（小时=滚动 / 天=整日），所以切粒度要重新取数，
+    // 不能只本地重画——本地画的还是上一个口径的卡片/表。
+    loadUsage();
+  });
+}
 
 /* ── 积分构成 ─────────────────────────────────────────────────────── */
 /* 一个账号的余额是若干积分包之和。包按来源命名（「国内运营裂变包」「拉新权益包」

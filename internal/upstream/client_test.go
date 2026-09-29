@@ -444,6 +444,33 @@ func TestUserResourceNegativeClamped(t *testing.T) {
 	}
 }
 
+// TestCreditPackagesEndTimeFallsBackToCycleEndTime 逐包到期字段回退：
+// 上游 ExpiredTime/PackageEndTime 恒空，真值在 CycleEndTime——不回退它，
+// 「积分构成」的到期列永远是「无到期」。
+func TestCreditPackagesEndTimeFallsBackToCycleEndTime(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[
+			{"PackageName":"带回退","CycleCapacitySize":100,"CycleCapacityRemain":100,"CycleEndTime":"2026-10-25 21:11:33"},
+			{"PackageName":"显式优先","CycleCapacitySize":100,"CycleCapacityRemain":100,"ExpiredTime":"2026-11-01 00:00:00","CycleEndTime":"2026-10-25 21:11:33"}
+		]}}}}`), nil
+	})
+	packs, _, _, err := c.CreditPackages(&auth.Auth{AccessToken: "at"})
+	if err != nil {
+		t.Fatalf("packages: %v", err)
+	}
+	if len(packs) != 2 {
+		t.Fatalf("packs=%d want 2", len(packs))
+	}
+	for _, p := range packs {
+		if p.Name == "带回退" && p.EndTime != "2026-10-25 21:11:33" {
+			t.Errorf("回退失败: EndTime=%q", p.EndTime)
+		}
+		if p.Name == "显式优先" && p.EndTime != "2026-11-01 00:00:00" {
+			t.Errorf("显式字段应优先: EndTime=%q", p.EndTime)
+		}
+	}
+}
+
 func TestDailyCheckinAlready(t *testing.T) {
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/daily-checkin") {

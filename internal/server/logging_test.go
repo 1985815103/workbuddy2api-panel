@@ -11,6 +11,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
 // captureStdout 重定向 os.Stdout（连同 chatLogOut，见 SetChatLogOutput 的注入点）
@@ -68,6 +69,116 @@ func TestChatStatsReaderNoUsage(t *testing.T) {
 	_, _ = io.Copy(io.Discard, r)
 	if toks, ok := r.Tokens(); ok || toks != 0 {
 		t.Errorf("tokens=%d ok=%v, want 0/false for missing usage", toks, ok)
+	}
+}
+
+// 流式路径：末帧 usage.credit 进 Usage()，供用量记录器累计积分消耗。
+func TestChatStatsReaderCreditFromUsage(t *testing.T) {
+	sse := "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14,\"credit\":1.25}}\n\n" +
+		"data: [DONE]\n\n"
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	_, _ = io.Copy(io.Discard, r)
+	usage := r.Usage()
+	if !usage.HasCredit || usage.Credit != 1.25 {
+		t.Fatalf("credit=%v ok=%v, want 1.25/true", usage.Credit, usage.HasCredit)
+	}
+	// 免费请求 credit=0：是观测值，HasCredit 必须为 true（区分「全免费」与「未上报」）。
+	free := "data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"credit\":0}}\n\ndata: [DONE]\n\n"
+	r2 := newChatStatsReaderSince(strings.NewReader(free), time.Now())
+	_, _ = io.Copy(io.Discard, r2)
+	if u := r2.Usage(); !u.HasCredit || u.Credit != 0 {
+		t.Fatalf("free credit=%v ok=%v, want 0/true", u.Credit, u.HasCredit)
+	}
+}
+
+// 非流式路径：usageDeltaFromResponse 提取 usage.credit；缺失时不置 HasCredit。
+func TestUsageDeltaFromResponseCredit(t *testing.T) {
+	d := usageDeltaFromResponse(map[string]any{
+		"usage": map[string]any{"prompt_tokens": 10.0, "completion_tokens": 5.0, "total_tokens": 15.0, "credit": 2.5},
+	})
+	if !d.HasCredit || d.Credit != 2.5 {
+		t.Fatalf("credit=%v ok=%v, want 2.5/true", d.Credit, d.HasCredit)
+	}
+	d2 := usageDeltaFromResponse(map[string]any{
+		"usage": map[string]any{"prompt_tokens": 10.0, "completion_tokens": 5.0, "total_tokens": 15.0},
+	})
+	if d2.HasCredit {
+		t.Fatalf("未上报 credit 时 HasCredit 应为 false: %+v", d2)
+	}
+}
+
+// 流式路径：末帧 usage 的前缀缓存口径进 Usage()——面板拆「积分 ÷ 合计 token」的依据。
+func TestChatStatsReaderCacheTokensFromUsage(t *testing.T) {
+	sse := "data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":4,\"total_tokens\":104," +
+		"\"prompt_cache_hit_tokens\":90,\"prompt_cache_miss_tokens\":10}}\n\ndata: [DONE]\n\n"
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	_, _ = io.Copy(io.Discard, r)
+	u := r.Usage()
+	if !u.HasCacheTokens || u.CacheHitTokens != 90 || u.CacheMissTokens != 10 {
+		t.Fatalf("cache=%+v, want hit=90 miss=10 has=true", u)
+	}
+
+	// 只报一半（成对约定被破坏）→ 按未上报处理：把「没报 miss」读成「miss=0」
+	// 会凭空造出一个 100% 命中率，比读成"无数据"危险得多。
+	partial := "data: {\"usage\":{\"prompt_tokens\":100,\"prompt_cache_hit_tokens\":90}}\n\ndata: [DONE]\n\n"
+	r2 := newChatStatsReaderSince(strings.NewReader(partial), time.Now())
+	_, _ = io.Copy(io.Discard, r2)
+	if u2 := r2.Usage(); u2.HasCacheTokens {
+		t.Fatalf("只报 hit 时不应采信: %+v", u2)
+	}
+}
+
+// 非流式路径：usageDeltaFromResponse 同样提取前缀缓存口径，且成对才采信。
+func TestUsageDeltaFromResponseCache(t *testing.T) {
+	d := usageDeltaFromResponse(map[string]any{
+		"usage": map[string]any{
+			"prompt_tokens": 10.0, "prompt_cache_hit_tokens": 8.0, "prompt_cache_miss_tokens": 2.0,
+		},
+	})
+	if !d.HasCacheTokens || d.CacheHitTokens != 8 || d.CacheMissTokens != 2 {
+		t.Fatalf("cache=%+v, want hit=8 miss=2 has=true", d)
+	}
+	d2 := usageDeltaFromResponse(map[string]any{
+		"usage": map[string]any{"prompt_tokens": 10.0, "prompt_cache_hit_tokens": 8.0},
+	})
+	if d2.HasCacheTokens {
+		t.Fatalf("缺 miss 字段时 HasCacheTokens 应为 false: %+v", d2)
+	}
+}
+
+// 端到端透传：SSE 末帧的缓存口径经 chatStatsReader → usage.Delta → usage.Recorder
+// 落到分桶。中间任何一环丢字段都只表现为面板「命中率」恒空，单看解析层测不出来。
+func TestCacheTokensReachUsageRecorder(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"}}]}\n\n" +
+			"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]," +
+			"\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":6,\"total_tokens\":126," +
+			"\"prompt_cache_hit_tokens\":100,\"prompt_cache_miss_tokens\":20,\"credit\":1.5}}\n\n" +
+			"data: [DONE]\n\n", true
+	})
+	rec := usage.New("")
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+		Usage:    rec,
+	})
+	rec3 := httptest.NewRecorder()
+	h.ServeHTTP(rec3, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4.1-flash","stream":true,"messages":[]}`)))
+	if rec3.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec3.Code, rec3.Body)
+	}
+
+	s := rec.Snapshot(24, nil)
+	if s.Totals.CacheHitTokens != 100 || s.Totals.CacheMissTokens != 20 || s.Totals.CacheSamples != 1 {
+		t.Fatalf("cache 未落桶: %d/%d/%d, want 100/20/1",
+			s.Totals.CacheHitTokens, s.Totals.CacheMissTokens, s.Totals.CacheSamples)
+	}
+	if s.Totals.CacheHitRate <= 0.833 || s.Totals.CacheHitRate >= 0.834 {
+		t.Fatalf("hit rate = %v, want 100/120", s.Totals.CacheHitRate)
+	}
+	if s.Totals.Credits != 1.5 || s.Totals.TotalTokens != 126 {
+		t.Fatalf("同请求的积分/token 口径被带偏: credits=%v total=%d", s.Totals.Credits, s.Totals.TotalTokens)
 	}
 }
 
@@ -207,6 +318,8 @@ func TestLogChatRowFormat(t *testing.T) {
 	})
 	for _, want := range []string{
 		"| #", "deepseek-v4", "| stream |", "| 200 |", "示例号(00e26541)", "TTFB=412ms", "tok=1234", "tok/s   |", "total=",
+		// 速率 = 1234 ÷ (27.1s − 0.412s) = 46.2tok/s（生成窗口口径；旧总时长口径是 45.5）。
+		"46.2tok/s",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
@@ -214,6 +327,55 @@ func TestLogChatRowFormat(t *testing.T) {
 	}
 	if strings.Contains(out, "00e26541abcdef") {
 		t.Errorf("full uid leaked: %s", out)
+	}
+}
+
+// TestLogChatRowRateExcludesTTFB 锁定「tok/s 是解码速度」语义：TTFB 占大头时，
+// 分母必须扣掉首 token 延迟（100tok ÷ 4s 生成窗口 = 25.0tok/s），而不是摊进总时长
+// （100 ÷ 10s = 10.0tok/s）——后者正是「短回复速率虚低一个数量级」误导的来源。
+func TestLogChatRowRateExcludesTTFB(t *testing.T) {
+	withChatLog(t)
+	out := captureStdout(t, func() {
+		logChatRow(6*time.Second, 10*time.Second, "deepseek-v4.1-flash", "stream", "u1", "", http.StatusOK, 100)
+	})
+	if !strings.Contains(out, "25.0tok/s") {
+		t.Errorf("want decode rate 25.0tok/s (100tok / 4s gen window):\n%s", out)
+	}
+	if strings.Contains(out, "10.0tok/s") {
+		t.Errorf("rate must not be diluted by TTFB:\n%s", out)
+	}
+}
+
+// TestLogChatRowRateGuard 锁定可信度护栏：生成窗口 < 500ms（整包倒出，TTFB≈total）
+// 或 toks < 30 的行速率列显示 "-"，绝不输出小分母假象（如 39tok/26ms=1500tok/s）。
+func TestLogChatRowRateGuard(t *testing.T) {
+	withChatLog(t)
+	// 整包倒出：TTFB=11289ms、total=11.3s → 生成窗口仅 ~26ms（1502tok/s 假象来源）。
+	out := captureStdout(t, func() {
+		logChatRow(11289*time.Millisecond, 11315*time.Millisecond, "cn:glm-5.3", "stream", "u1", "", http.StatusOK, 39)
+	})
+	if !strings.Contains(out, "tok=39") {
+		t.Errorf("toks should still show:\n%s", out)
+	}
+	if strings.Contains(out, "tok/s") {
+		t.Errorf("rate must be suppressed for tiny window:\n%s", out)
+	}
+	// 样本过少：10tok / 2s 窗口足够大但 toks < 30，同样不出数。
+	out = captureStdout(t, func() {
+		logChatRow(time.Second, 3*time.Second, "cn:glm-5.3", "stream", "u1", "", http.StatusOK, 10)
+	})
+	if !strings.Contains(out, "tok=10") {
+		t.Errorf("toks should still show:\n%s", out)
+	}
+	if strings.Contains(out, "tok/s") {
+		t.Errorf("rate must be suppressed for tiny token sample:\n%s", out)
+	}
+	// 边界之上正常出数：31tok / 1s 窗口 → 31.0tok/s。
+	out = captureStdout(t, func() {
+		logChatRow(time.Second, 2*time.Second, "cn:glm-5.3", "stream", "u1", "", http.StatusOK, 31)
+	})
+	if !strings.Contains(out, "31.0tok/s") {
+		t.Errorf("want 31.0tok/s above guard thresholds:\n%s", out)
 	}
 }
 

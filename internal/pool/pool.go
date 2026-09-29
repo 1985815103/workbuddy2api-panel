@@ -53,6 +53,9 @@ type Pool struct {
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
 	// WAF 风控更紧，压低并发）；0 = 未设置，回落 maxInFlight（不分档，零回归）。
 	maxInFlightGlobal int
+	// sel 当前选号策略（pool.selection，weighted | drain）。写仅经 SetSelection
+	// （持写锁），读仅在 pick（持写锁）；New 时初始化为 weighted，不存在 nil 态。
+	sel selection
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
@@ -89,6 +92,7 @@ func New(stateFp string) *Pool {
 		costExploreInterval: defaultCostExploreInterval,
 		exploreLast:         map[string]time.Time{},
 	}
+	p.sel = weightedSel{p} // 缺省加权随机；pool.selection="drain" 时经 SetSelection 切换
 	if stateFp != "" {
 		p.load()
 		p.startFlusher()
@@ -107,6 +111,33 @@ func (p *Pool) Close() {
 		close(p.stopCh)
 	})
 	p.Flush()
+}
+
+// SetSelection 切换选号策略（pool.selection，面板保存配置热生效）。
+// 返回是否为已知策略名（未知返回 false 且保持原策略——配置校验应拦在前面，
+// 这里是最后一道防线）。
+func (p *Pool) SetSelection(name string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch name {
+	case SelectionDrain:
+		p.sel = drainSel{}
+	case "", SelectionWeighted:
+		p.sel = weightedSel{p}
+	default:
+		return false
+	}
+	return true
+}
+
+// SelectionName 当前选号策略名（面板回显用）。
+func (p *Pool) SelectionName() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.sel == nil {
+		return SelectionWeighted
+	}
+	return p.sel.name()
 }
 
 // SetBreaker 注入熔断器参数（main 从 config 解析后调用）。非正值保留原值（用默认）。

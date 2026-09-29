@@ -209,6 +209,16 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				e.modelCost[m] = modelCostEntry{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
 			}
 		}
+		// 风控信号台账：终身累计全量恢复（重启不清零——清零会抹掉「上游开始动手」的时间线）。
+		if len(s.RiskSignals) > 0 {
+			e.risk = make(map[string]riskSignal, len(s.RiskSignals))
+			for c, r := range s.RiskSignals {
+				if r.Count <= 0 || r.FirstSeen.IsZero() {
+					continue // 脏行不复活（次数/首现缺一律弃）
+				}
+				e.risk[c] = riskSignal{Count: r.Count, FirstSeen: r.FirstSeen, LastSeen: r.LastSeen}
+			}
+		}
 		p.byUID[uid] = e
 	}
 }
@@ -321,6 +331,14 @@ func (p *Pool) stateOverviewLocked() stateFile {
 					s.ModelCooldowns = map[string]stateModelCooldown{}
 				}
 				s.ModelCooldowns[m] = stateModelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
+			}
+		}
+		// 风控信号台账：终身累计，只增不减，全量落盘（重启不清零——清零会抹掉
+		// 「上游开始动手」的时间线证据）。
+		if len(e.risk) > 0 {
+			s.RiskSignals = make(map[string]stateRiskSignal, len(e.risk))
+			for c, r := range e.risk {
+				s.RiskSignals[c] = stateRiskSignal{Count: r.Count, FirstSeen: r.FirstSeen, LastSeen: r.LastSeen}
 			}
 		}
 		// 成本账本：惰性过滤过期观测（modelCostTTL 外不写——陈旧价格不复活）。

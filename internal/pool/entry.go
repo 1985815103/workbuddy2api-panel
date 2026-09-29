@@ -57,6 +57,20 @@ type TokenUsageDelta struct {
 	LatencyMs           int64
 	HasTokensPerSecond  bool
 	TokensPerSecond     float64
+	// CacheHitTokens/CacheMissTokens 是上游的前缀缓存口径
+	//（prompt_cache_hit_tokens / prompt_cache_miss_tokens）。
+	// 缓存命中的 prompt token 计价远低于全价——实测 deepseek-v4.1-flash 为**完全
+	// 免费**，glm-5.3 约为全价的 25%——所以「积分 ÷ 合计 token」在模型间不可比：
+	// 合计把命中与未命中混在一起。这两列是这个差值的唯一依据，透传给
+	// usage.Recorder 分桶（选号侧 RecordTokenUsage 不消费）。
+	// 上游按对下发，故一个 Has* 覆盖两值；未上报时不置零（同 HasCredit 口径）。
+	HasCacheTokens bool
+	CacheHitTokens int64
+	CacheMissTokens int64
+	// Credit 上游成功响应的 usage.credit（本次真实扣费积分），透传给
+	// usage.Recorder 做积分消耗统计；选号侧（RecordTokenUsage）不消费它。
+	HasCredit bool
+	Credit    float64
 }
 
 // Status 单个账号对外暴露的状态（脱敏）。
@@ -96,6 +110,9 @@ type Status struct {
 	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
 	// samples）；无观测/全部过期 → nil（tier 1 未知层）。
 	ModelCosts []ModelCostStatus `json:"model_costs,omitempty"`
+	// RiskSignals 风控信号终身台账（见 entry.risk）。nil = 该号从未出现过
+	// 风控相关错误码——面板据此区分「干净」与「在漏报」。
+	RiskSignals []RiskSignalStatus `json:"risk_signals,omitempty"`
 	// ConsecutiveFails 连续失败计数（连败降权用，见 entry.consecutiveFails）。
 	// 零值也透出（运维口径：与 err_total/session_dead_fails 一致，零值缺失会让人
 	// 误以为"没记录"，实际是零值被 omitempty 省略）。
@@ -110,6 +127,14 @@ type Status struct {
 // ModelCostStatus 单个 (账号, 模型) 的成本台账行（P1-anti-monopoly 可观测性）。
 // tier 不单独落字段：cost_per_1k ≤ 0 即 tier 0（免费），> 0 即 tier 2（收费），
 // 无观测即 tier 1——由调用方/面板按值推出，避免双表示漂移。
+// RiskSignalStatus 单个风控错误码的台账行（次数 + 首现/最近时刻）。
+type RiskSignalStatus struct {
+	Code      string    `json:"code"`
+	Count     int64     `json:"count"`
+	FirstSeen time.Time `json:"first_seen"`
+	LastSeen  time.Time `json:"last_seen"`
+}
+
 type ModelCostStatus struct {
 	Model string `json:"model"`
 	// CostPer1k 实测每千 token 单价（EMA 平滑值）。≤0 = 实测免费（tier 0）。
@@ -166,6 +191,14 @@ type modelCostEntry struct {
 	CostPer1k float64
 	LastSeen  time.Time
 	Samples   int
+}
+
+// riskSignal 单个风控相关错误码的终身台账行（面板「风控信号」列）。
+// 只增不减：这些码的价值在「出现过」，清零会抹掉上游开始动手的证据。
+type riskSignal struct {
+	Count     int64
+	FirstSeen time.Time
+	LastSeen  time.Time
 }
 type entry struct {
 	a            *auth.Auth
@@ -227,6 +260,11 @@ type entry struct {
 	// 出池）。与冷却/熔断**取更长者不叠加**（healthy 判定是并列或门，任一截止
 	// 未到期即不可选，生效的一定是最远者），到期自动回池，无需显式复位。
 	degradeUntil time.Time
+	// risk 风控信号终身台账：code（12153/14018/11102/6004/429/waf403/11140）→ 观测。
+	// 由 applyErrorPolicy 的分类分支喂入（NoteRiskSignal），面板据此回答
+	// 「上游是否开始对号动手」——尤其 12153/11140/waf403 这三个，是单号/整 IP
+	// 维度处置的早期信号。持久化（stateAccount.RiskSignals），重启不清零。
+	risk map[string]riskSignal
 	// modelCost 实测扣费账本：model → 观测。由每次成功请求的 usage.credit
 	// 折算而来（上游没有"按模型的用量"接口，只能实测）。选号时据此把「该模型上
 	// 免费/便宜的号」排在前面（pick 的 costTier 硬分层）。
@@ -449,6 +487,8 @@ type stateAccount struct {
 	// 重新付学费探测。落盘/恢复均按 modelCostTTL 惰性过滤（6h 外不写不恢复——
 	// 陈旧价格不复活）；恢复侧剔除非法值（负 per1k/零 LastSeen 的结构破损条目）。
 	ModelCosts map[string]stateModelCost `json:"model_costs,omitempty"`
+	// RiskSignals 风控信号终身台账（只增不减，见 entry.risk）。
+	RiskSignals map[string]stateRiskSignal `json:"risk_signals,omitempty"`
 }
 
 // stateModelCooldown 单个 (账号, 模型) 的模型级独立冷却持久化记录，与运行态
@@ -463,6 +503,13 @@ type stateModelCooldown struct {
 
 // stateModelCost 单个 (账号, 模型) 的成本观测持久化记录，与运行态 modelCostEntry
 // 同构（单一表示，内存与落盘不搞两套）。
+// stateRiskSignal 风控信号台账的落盘镜像（与 pool.riskSignal 字段一一对应）。
+type stateRiskSignal struct {
+	Count     int64     `json:"count"`
+	FirstSeen time.Time `json:"first_seen"`
+	LastSeen  time.Time `json:"last_seen"`
+}
+
 type stateModelCost struct {
 	CostPer1k float64   `json:"cost_per_1k"`
 	LastSeen  time.Time `json:"last_seen"`

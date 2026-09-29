@@ -13,9 +13,19 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+
 )
 
 // Config 顶层配置。
+// APIUser api_users 单条绑定（key → 账号）。Name 仅为展示（日志/错误文案），
+// 参与路由的只有 UID。
+type APIUser struct {
+	UID  string `json:"uid"`
+	Name string `json:"name,omitempty"`
+}
+
 type Config struct {
 	Listen    string `json:"listen"`     // ":7863"
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
@@ -35,6 +45,12 @@ type Config struct {
 		// RequestArchiveMaxMB 归档总上限（MiB），缺省 100；<=0 回落默认。
 		RequestArchiveMaxMB int `json:"request_archive_max_mb"`
 	} `json:"logging"`
+
+	// APIUsers 按用户绑号（api_users）：key → 绑定账号。该 key 的 /v1 请求只走
+	// 绑定的号、绝不轮换到池内其他号（谁的 key 记谁的账）；绑定号不可用时直接报
+	// bound_account_unavailable，而不是换号——换号就破坏了归属承诺。
+	// 面板与 /status 仍只认主 api_key；key 与主 api_key 相同视为配置错误（normalize 拒绝）。
+	APIUsers map[string]APIUser `json:"api_users,omitempty"`
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -164,6 +180,11 @@ type Config struct {
 		// 错误策略）。默认 "30m"（≤48 次/天/模型）；"0" 关停（完全回到现状行为）；
 		// 空值回落默认。
 		CostExploreInterval string `json:"cost_explore_interval"`
+		// Selection 选号策略（策略模式，面板配置页可热切换）：
+		//   weighted（缺省）= 三因子加权随机 + Top5 短名单，打散热点、多号并行；
+		//   drain = 同过期段串行耗尽：到期最早段优先，段内余额最小者做「排水头」，
+		//   耗尽一个再下一个，中间不切号（粘性缓存友好 + 快过期积分优先消耗）。
+		Selection string `json:"selection"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -459,6 +480,33 @@ func (c *Config) normalize() error {
 	if c.Pool.CostExploreInterval == "" {
 		c.Pool.CostExploreInterval = "30m"
 	}
+	// pool.selection 选号策略校验：未知值直接报错（面板下拉只出两项，手写 config
+	// 打错字在这里 fail fast），空值回落 weighted。
+	switch c.Pool.Selection {
+	case "":
+		c.Pool.Selection = pool.SelectionWeighted
+	case pool.SelectionWeighted, pool.SelectionDrain:
+	default:
+		return fmt.Errorf("pool.selection 必须是 %s 或 %s（当前 %q）", pool.SelectionWeighted, pool.SelectionDrain, c.Pool.Selection)
+	}
+
+	// api_users 绑号表清理：剔除空 key/空 uid 的条目；key 与主 api_key 相同直接
+	// 报错——那会让绑定 key 拿到管理员权限（/status、面板），权限边界失守。
+	if len(c.APIUsers) > 0 {
+		clean := make(map[string]APIUser, len(c.APIUsers))
+		for k, u := range c.APIUsers {
+			k = strings.TrimSpace(k)
+			if k == "" || strings.TrimSpace(u.UID) == "" {
+				continue
+			}
+			if k == c.APIKey {
+				return fmt.Errorf("api_users: key 不能与主 api_key 相同（会绕过面板/status 的管理员边界）")
+			}
+			clean[k] = APIUser{UID: strings.TrimSpace(u.UID), Name: strings.TrimSpace(u.Name)}
+		}
+		c.APIUsers = clean
+	}
+
 	if c.CostExploreIntervalDur, err = time.ParseDuration(c.Pool.CostExploreInterval); err != nil {
 		return fmt.Errorf("pool.cost_explore_interval: %w", err)
 	}
